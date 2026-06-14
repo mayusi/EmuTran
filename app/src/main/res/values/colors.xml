@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_launcher_background">#000000</color>
+    <!-- Match Compose background (Theme.kt EmuTranColors.background) so the
+         pre-Compose splash flash blends in. Pure black for the monochrome theme. -->
+    <color name="splash_window_background">#000000</color>
+</resources>

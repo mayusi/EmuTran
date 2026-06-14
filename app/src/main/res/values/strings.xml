@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">EmuTran</string>
+
+    <!-- Splash -->
+    <string name="splash_tagline">Set up emulation in one tap.</string>
+
+    <!-- Permissions screen -->
+    <string name="perm_title">Permissions</string>
+    <string name="perm_intro">EmuTran needs a few permissions to do its job. Here\'s what each one is for.</string>
+    <string name="perm_install">Install apps — install emulators after downloading.</string>
+    <string name="perm_notifications">Notifications — show download progress.</string>
+    <string name="perm_all_files">All files access — create the Emulation folder tree.</string>
+    <string name="perm_grant">Grant</string>
+    <string name="perm_granted">Granted</string>
+    <string name="perm_continue">Continue</string>
+
+    <!-- Device info -->
+    <string name="device_title">Your device</string>
+    <string name="device_continue">Looks right</string>
+    <string name="device_screen_type">Screen type</string>
+    <string name="device_standard">Single screen</string>
+    <string name="device_dual">Dual screen</string>
+
+    <!-- Folder pick -->
+    <string name="folder_title">Where should the Emulation folder live?</string>
+    <string name="folder_continue">Use this folder</string>
+
+    <!-- Done screen -->
+    <string name="done_title">Your device is ready.</string>
+    <string name="done_next_steps">Next steps:</string>
+    <string name="done_step_bios">Drop your BIOS files into the folders we made. Each one has a README explaining what to put there.</string>
+    <string name="done_step_roms">Transfer your ROMs to Emulation/roms/&lt;system&gt;/.</string>
+    <string name="done_step_configure">Open each emulator once and point it at your ROM folder.</string>
+</resources>

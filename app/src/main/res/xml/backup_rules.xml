@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Back up user preferences (datastore + room) only. Caches and
+         downloaded APKs naturally aren't backed up since they live in
+         cacheDir, which the auto-backup framework excludes by default. -->
+    <include domain="sharedpref" />
+    <include domain="database" />
+    <include domain="file" path="datastore/" />
+</full-backup-content>

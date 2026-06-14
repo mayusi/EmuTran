@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Per-host cleartext whitelist.
+
+  Most of our traffic is HTTPS (GitHub, Codeberg, all official mirrors)
+  and we keep cleartext OFF globally. But a handful of legitimate sources
+  redirect to plain HTTP for the actual download payload. We allow only
+  the exact host(s) that need it so we don't open the rest of the app to MITM.
+
+  ppsspp.org — their /download page is HTTPS, but the APK asset URLs
+  (.../files/1_20_4/ppsspp.apk) redirect to HTTP at fetch time.
+  Confirmed via curl and by the cleartext-policy crash users hit.
+
+  FIX 3 (transport hardening): Changed includeSubdomains from "true" to "false"
+  to scope the cleartext exception to the apex domain only. The actual APK
+  download lands on the ppsspp.org apex host (not a subdomain), so this is
+  sufficient. Narrowing subdomain scope reduces the cleartext surface in case
+  a subdomain is ever compromised or pointed to an attacker-controlled server.
+
+  If a future PPSSPP release changes their CDN to a subdomain (e.g.
+  files.ppsspp.org), add that specific subdomain as a second <domain> entry
+  rather than re-enabling includeSubdomains="true" on the apex.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system"/>
+        </trust-anchors>
+    </base-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <!-- includeSubdomains="false": cleartext only for ppsspp.org itself,
+             not for *.ppsspp.org subdomains. See comment above. -->
+        <domain includeSubdomains="false">ppsspp.org</domain>
+    </domain-config>
+</network-security-config>

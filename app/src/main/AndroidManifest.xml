@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Network for downloading APKs and manifest -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Install APKs we downloaded -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- Foreground service for long-running download/install batches -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- Notification permission (Android 13+) for progress notifications -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Wake lock so big batches don't get killed mid-install -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!--
+      Storage strategy: MANAGE_EXTERNAL_STORAGE.
+
+      Why not SAF? On AYN Odin 3 (and likely other vendor builds) the stock
+      SAF picker refuses tree-level grants even on user-created folders,
+      making the silent-scaffolding UX impossible. This permission gives us
+      one-time all-files access, which is the same model RetroArch / ES-DE /
+      Cocoon Shell all use. Justification for F-Droid: we need to create a
+      sprawling folder structure outside our app sandbox so the user's
+      emulators (other apps) can read from it.
+    -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+    <!-- Pre-R fallback for completeness on Android 10 (rarely hit). -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <!--
+      Needed so PackageManager.getInstalledPackages() returns the full
+      list on Android 11+. We use this to flag entries the user has
+      already installed (e.g., they already have Flycast → no point
+      downloading it again). Same permission Obtainium itself uses
+      for its installed-app tracking.
+    -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <queries>
+        <!-- Lets us detect whether Shizuku is installed -->
+        <package android:name="moe.shizuku.privileged.api" />
+    </queries>
+
+    <!--
+      allowBackup=false: no user data worth backing up here. Disabling prevents
+      adb backup and cloud backup from inadvertently exposing DataStore prefs,
+      the HTTP response cache, and update epoch timestamps. The dataExtractionRules
+      and fullBackupContent attributes below are inert while allowBackup is false.
+    -->
+    <application
+        android:name=".EmuTranApplication"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.EmuTran"
+        android:enableOnBackInvokedCallback="true"
+        android:networkSecurityConfig="@xml/network_security_config"
+        tools:targetApi="34">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.EmuTran">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- FileProvider for serving downloaded APK files to the system installer -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <!-- Foreground service: keeps process alive + shows progress notification
+             during the download/install pipeline. foregroundServiceType="dataSync"
+             matches FOREGROUND_SERVICE_DATA_SYNC permission declared above. -->
+        <service
+            android:name=".service.SetupForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Shizuku provider hook (lets Shizuku auto-grant peer permission) -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!--
+          Disable WorkManager's default (ContentProvider-based) auto-initializer.
+          We supply a custom Configuration via EmuTranApplication.workManagerConfiguration
+          so that HiltWorkerFactory is used for @HiltWorker injection.
+          Without this removal WorkManager initialises itself before Hilt is ready,
+          causing a crash when any @HiltWorker tries to resolve its @Inject dependencies.
+        -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+        </provider>
+    </application>
+
+</manifest>

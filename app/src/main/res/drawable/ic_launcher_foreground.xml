@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Intentional v0.x app mark: a minimalist white gamepad silhouette on the
+     black adaptive background. Monochrome to match the app's black & white
+     theme. Content stays within the central adaptive safe zone (~26..82). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Controller body: a rounded capsule with two grip lobes. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M40,40
+            C32,40 28,46 26,53
+            L22,68
+            C20,75 24,80 30,80
+            C34,80 37,78 39,74
+            L42,68
+            L66,68
+            L69,74
+            C71,78 74,80 78,80
+            C84,80 88,75 86,68
+            L82,53
+            C80,46 76,40 68,40
+            Z
+            M40,46
+            L68,46
+            C72,46 75,49 76,54
+            L80,69
+            C81,72 79,74 77,74
+            C75,74 74,73 73,71
+            L69,63
+            C68,62 67,62 66,62
+            L42,62
+            C41,62 40,62 39,63
+            L35,71
+            C34,73 33,74 31,74
+            C29,74 27,72 28,69
+            L32,54
+            C33,49 36,46 40,46
+            Z" />
+    <!-- D-pad (left). -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M41,52 L46,52 L46,55 L49,55 L49,60 L46,60 L46,63 L41,63 L41,60 L38,60 L38,55 L41,55 Z" />
+    <!-- Two action buttons (right). -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M64,52 m-3,0 a3,3 0 1,0 6,0 a3,3 0 1,0 -6,0 Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M71,59 m-3,0 a3,3 0 1,0 6,0 a3,3 0 1,0 -6,0 Z" />
+</vector>
