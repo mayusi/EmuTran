@@ -11,11 +11,21 @@
 
 EmuTran turns the tedious, multi-hour job of setting up an Android gaming handheld into a single guided flow. It identifies your device, lets you pick your emulators from a curated catalog, downloads them from their official source repositories, installs them silently (or with standard prompts if Shizuku is unavailable), and creates the full Emulation folder tree — all in one go. Built for Retroid Pocket, AYN Odin, and Anbernic owners who want a clean setup without the forum archaeology.
 
-<p align="center">
-  <img src="screenshots/dashboard.png" width="240" alt="Dashboard — installed emulators and quick actions">
-  <img src="screenshots/pickapps.png" width="240" alt="Pick emulators — 4-column catalog with search and filter chips">
-  <img src="screenshots/permissions.png" width="240" alt="Permissions wizard — transparent explanations for each grant">
-</p>
+---
+
+## Screenshots
+
+**The dashboard** — manage installed emulators, see available updates, and reach every action from one controller-friendly hub.
+
+<img src="screenshots/dashboard.png" alt="EmuTran dashboard — installed emulators, updates, and quick actions" width="100%">
+
+**Pick your emulators** — a searchable, filterable catalog of 40+ emulators; choose what you want, or hit Quick Setup for the recommended stack.
+
+<img src="screenshots/pickapps.png" alt="Emulator picker — searchable catalog with category filters" width="100%">
+
+**Transparent permissions** — every permission is explained in plain language up front, so there are no surprises about what EmuTran accesses or why.
+
+<img src="screenshots/permissions.png" alt="Permissions wizard — a plain-language reason for each grant" width="100%">
 
 ---
 
