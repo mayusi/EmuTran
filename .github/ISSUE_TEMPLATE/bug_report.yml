@@ -1,0 +1,42 @@
+name: Bug report
+description: Something isn't working
+labels: [bug]
+body:
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      placeholder: e.g. Retroid Pocket 6, AYN Odin 2, Anbernic RG556
+    validations:
+      required: true
+  - type: input
+    id: android
+    attributes:
+      label: Android version
+      placeholder: e.g. Android 13
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: EmuTran version
+      placeholder: e.g. v0.2.0 (shown on the About screen)
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What went wrong, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: false
