@@ -50,8 +50,13 @@ class SetupStateDetector @Inject constructor(
         if (picks.isNotEmpty()) signals++
 
         // Signal 3: at least one manifest app currently installed.
+        // Uses loadBundledOnly() (no network, no disk cache) so startup routing
+        // works fully offline on first cold boot without waiting on GitHub Raw.
+        // The bundled asset is always accurate enough for this routing check;
+        // the live network refresh happens lazily when the user opens Dashboard
+        // or PickApps (via loadStandard/loadDualScreen, unchanged).
         val installed = installedApps.snapshot()
-        val manifestIds = runCatching { manifestParser.loadStandard() }
+        val manifestIds = runCatching { manifestParser.loadBundledOnly() }
             .getOrDefault(emptyList())
             .map { it.id }
             .toSet()
@@ -60,7 +65,7 @@ class SetupStateDetector @Inject constructor(
         signals >= 2
     }
 
-    private fun hasEmulationTree(rootPath: String): Boolean {
+    internal fun hasEmulationTree(rootPath: String): Boolean {
         val root = File(rootPath)
         val emulationDir = if (root.name.equals("Emulation", ignoreCase = true)) {
             root

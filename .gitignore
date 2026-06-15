@@ -50,3 +50,10 @@ Thumbs.db
 
 # Loose root-level debug screenshots (not source); real README assets live in /screenshots/
 /*.png
+
+# Local orchestration workflow scripts (not part of the app)
+/.audit-*.mjs
+
+# Stray Gradle user-home dirs accidentally created in-tree by a relative GRADLE_USER_HOME
+/Tempgradle_*/
+/gradle_emutran*/

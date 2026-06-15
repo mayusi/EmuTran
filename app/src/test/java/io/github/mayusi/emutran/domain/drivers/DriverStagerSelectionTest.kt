@@ -3,15 +3,19 @@ package io.github.mayusi.emutran.domain.drivers
 import com.google.common.truth.Truth.assertThat
 import io.github.mayusi.emutran.data.device.GpuFamily
 import io.github.mayusi.emutran.data.device.GpuInfo
+import io.github.mayusi.emutran.data.source.GhAsset
+import io.github.mayusi.emutran.data.source.GhRelease
 import io.mockk.mockk
+import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import org.junit.Test
 
 class DriverStagerSelectionTest {
 
-    // DriverStager now requires an injected OkHttpClient. The selection
-    // tests are pure (no network calls), so a relaxed mock is sufficient.
-    private val stager = DriverStager(mockk<OkHttpClient>(relaxed = true))
+    // DriverStager now requires an injected OkHttpClient and Json. The selection
+    // tests are pure (no network, no JSON parsing), so a relaxed OkHttpClient
+    // mock and a default Json instance are sufficient.
+    private val stager = DriverStager(mockk<OkHttpClient>(relaxed = true), Json)
 
     /** Releases modeled on the real K11MCH1/AdrenoToolsDrivers API,
      * newest-first. */
@@ -35,10 +39,10 @@ class DriverStagerSelectionTest {
     )
 
     private fun release(tag: String, vararg assets: String) =
-        DriverStager.GhRelease(
+        GhRelease(
             tagName = tag,
             name = tag,
-            assets = assets.map { DriverStager.GhAsset(name = it, size = 1, browserDownloadUrl = "https://x/$it") },
+            assets = assets.map { GhAsset(name = it, size = 1, browserDownloadUrl = "https://x/$it") },
         )
 
     private fun adreno(model: Int?, renderer: String = "Adreno (TM) ${model ?: ""}") =

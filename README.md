@@ -1,6 +1,7 @@
 # EmuTran
 
 [![Latest release](https://img.shields.io/github/v/release/mayusi/EmuTran?style=flat-square&label=release&color=2ea043)](https://github.com/mayusi/EmuTran/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/mayusi/EmuTran/total?style=flat-square&label=downloads&color=555)](https://github.com/mayusi/EmuTran/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Android 10+](https://img.shields.io/badge/android-10%2B-555?style=flat-square)](#requirements)
 

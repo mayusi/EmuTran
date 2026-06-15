@@ -1,11 +1,16 @@
 package io.github.mayusi.emutran.ui.dashboard
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import io.github.mayusi.emutran.data.device.GpuDetector
+import io.github.mayusi.emutran.data.device.GpuInfo
 import io.github.mayusi.emutran.data.device.InstalledAppsRegistry
 import io.github.mayusi.emutran.data.manifest.AppEntry
+import io.github.mayusi.emutran.data.manifest.ManifestDiffStore
 import io.github.mayusi.emutran.data.manifest.ObtainiumPackParser
+import io.github.mayusi.emutran.data.manifest.PendingPackDiff
 import io.github.mayusi.emutran.data.manifest.SourceKind
 import io.github.mayusi.emutran.data.manifest.SystemTag
 import io.github.mayusi.emutran.data.selection.SelectedAppsStore
@@ -20,11 +25,14 @@ import io.github.mayusi.emutran.data.update.UpdateInfo
 import io.github.mayusi.emutran.data.update.UpdateProgress
 import io.github.mayusi.emutran.data.update.UpdateRepository
 import io.github.mayusi.emutran.domain.download.ApkDownloader
+import io.github.mayusi.emutran.domain.drivers.DriverHintProvider
 import io.github.mayusi.emutran.domain.install.InstallerRouter
 import io.github.mayusi.emutran.domain.install.Uninstaller
 import io.github.mayusi.emutran.domain.scaffold.resolveTurnipDir
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -44,21 +52,16 @@ import javax.inject.Inject
  * Dashboard: shows every manifest emulator with its installed/not
  * status, supports per-app reinstall (== update) and uninstall.
  *
- * Update detection: lightweight per-app update state is provided by
- * [UpdateRepository.updateState] and surfaced as [updateState] / [updateCount].
- * Real-time progress from [UpdateRepository.updateProgressFlow] is reflected
- * per-card as [updateProgressMap]. "Check now" calls [updateRepository.checkNow]
- * with force=true; "Update all" calls [updateRepository.updateAll].
+ * FIX 3b: [refresh] is debounced — rapid successive calls coalesce into
+ *   one load() so updateAll()'s N terminal events don't fire N page reloads.
  *
- * Self-update banner: on init, [SelfUpdateRepository.bannerState] is called
- * (24h-gated, respects the user's "skip this version" preference). The result
- * is held in [selfUpdate]. When Available, the dashboard renders an inline
- * banner above the EmuHelper card. Tapping "What's new" opens a ModalBottomSheet
- * with [SelfUpdateSheetUiState] driving the download progress.
- *
- * Uninstall fires the system uninstall intent — Android handles the
- * confirmation dialog, we react to ON_RESUME by refreshing the installed
- * snapshot.
+ * FIX 5: [emuHelperInstalled] is a StateFlow updated via a coroutine on
+ *   resume-trigger, removing the synchronous PM call from the composition thread.
+ *   [installEmuHelper] delegates to [downloadAndInstall].
+ *   The "904332840" inline string is replaced with [ObtainiumPackParser.OBTAINIUM_META_ENTRY_ID].
+ *   [checkSelfUpdateBanner] logs failures to Logcat.
+ *   [startSelfUpdateDownload] throttles progress emissions to ~200ms intervals.
+ *   CancellationException from a cancelled download is not surfaced as a failure snackbar.
  */
 @HiltViewModel
 class DashboardViewModel @Inject constructor(
@@ -73,6 +76,9 @@ class DashboardViewModel @Inject constructor(
     private val setupOptions: SetupOptionsStore,
     private val updateRepository: UpdateRepository,
     private val selfUpdateRepository: SelfUpdateRepository,
+    private val driverHintProvider: DriverHintProvider,
+    private val gpuDetector: GpuDetector,
+    private val manifestDiffStore: ManifestDiffStore,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow<UiState>(UiState.Loading)
@@ -82,29 +88,15 @@ class DashboardViewModel @Inject constructor(
     private val _busy = MutableStateFlow<Set<String>>(emptySet())
     val busy: StateFlow<Set<String>> = _busy.asStateFlow()
 
-    /** True while the featured EmuHelper APK is downloading/installing. */
-    private val _emuHelperInstalling = MutableStateFlow(false)
-    val emuHelperInstalling: StateFlow<Boolean> = _emuHelperInstalling.asStateFlow()
-
     /** User-facing messages for update/install/uninstall actions (success or failure). */
     private val _userMessage = MutableSharedFlow<String>(extraBufferCapacity = 1)
     val userMessage: SharedFlow<String> = _userMessage.asSharedFlow()
 
     // ── Self-update banner ───────────────────────────────────────────────────
 
-    /**
-     * 24h-gated EmuTran self-update check. Null until the initial check
-     * completes. Set to [SelfUpdateResult.Available] when a new release is
-     * found (and the user hasn't skipped it). Cleared by [dismissSelfUpdateBanner]
-     * (session-only) or [skipSelfUpdate] (persisted).
-     */
     private val _selfUpdate = MutableStateFlow<SelfUpdateResult?>(null)
     val selfUpdate: StateFlow<SelfUpdateResult?> = _selfUpdate.asStateFlow()
 
-    /**
-     * Bottom-sheet state for the self-update flow on the dashboard.
-     * Null → sheet closed. Non-null → sheet open with given state.
-     */
     private val _selfUpdateSheet = MutableStateFlow<SelfUpdateSheetUiState?>(null)
     val selfUpdateSheet: StateFlow<SelfUpdateSheetUiState?> = _selfUpdateSheet.asStateFlow()
 
@@ -113,44 +105,68 @@ class DashboardViewModel @Inject constructor(
 
     // ── Update-repository wiring ─────────────────────────────────────────────
 
-    /**
-     * Map of entryId → UpdateInfo. Drives per-card "Update vX" chip display.
-     * Collected from [UpdateRepository.updateState] — always fresh from DataStore.
-     */
     val updateState: StateFlow<Map<String, UpdateInfo>> = updateRepository.updateState()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap())
 
-    /**
-     * Number of installed apps with a detected update. Drives the header
-     * "Update all" hero when > 0.
-     */
     val updateCount: StateFlow<Int> = updateRepository.updateCount()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
 
-    /**
-     * Real-time per-entryId progress snapshot.
-     * Key = entryId; value = latest [UpdateProgress] event for that app.
-     * Cleared when [UpdateProgress.Done] / [UpdateProgress.Cancelled] /
-     * [UpdateProgress.Failed] arrives so stale spinners don't linger.
-     */
     private val _updateProgressMap = MutableStateFlow<Map<String, UpdateProgress>>(emptyMap())
     val updateProgressMap: StateFlow<Map<String, UpdateProgress>> = _updateProgressMap.asStateFlow()
 
     /** The featured EmuHelper card's app entry. */
     val emuHelper: AppEntry = emuHelperEntry()
 
+    // FIX 5: emuHelperInstalled is a StateFlow updated off the main thread.
+    // Screens collect this instead of calling the blocking snapshot() in composition.
+    private val _emuHelperInstalled = MutableStateFlow(false)
+    val emuHelperInstalled: StateFlow<Boolean> = _emuHelperInstalled.asStateFlow()
+
+    // FIX 5: emuHelperInstalling kept as StateFlow so UI can disable the button.
+    private val _emuHelperInstalling = MutableStateFlow(false)
+    val emuHelperInstalling: StateFlow<Boolean> = _emuHelperInstalling.asStateFlow()
+
+    // FIX 3b: debounce refresh — cancel-and-relaunch so rapid successive calls
+    // (e.g. N Done events from updateAll) coalesce into one load().
+    private var refreshJob: Job? = null
+
+    // ── Per-emulator driver hints ────────────────────────────────────────────
+
+    /**
+     * Cached GPU snapshot, resolved once via the suspend [GpuDetector.snapshot]
+     * (the EGL probe is expensive and must not run on the main thread). Null
+     * until [resolveDriverHints] completes; lookups before then yield no hint.
+     */
+    @Volatile private var gpuSnapshot: GpuInfo? = null
+
+    /**
+     * Map of emulator appId -> one-line driver hint, recomputed whenever the
+     * entry list or the GPU snapshot changes. Populated only when the device
+     * GPU is Adreno AND the entry is a known emulator; otherwise the appId is
+     * absent and the UI renders no hint line (so card layout is unchanged).
+     */
+    private val _driverHints = MutableStateFlow<Map<String, String>>(emptyMap())
+    val driverHints: StateFlow<Map<String, String>> = _driverHints.asStateFlow()
+
+    // ── Manifest "what's new" banner ─────────────────────────────────────────
+
+    /**
+     * Pending catalog diff to surface as a dismissible banner. Null when there
+     * is nothing new (first launch, no-change refresh, or already dismissed).
+     */
+    val pendingPackDiff: StateFlow<PendingPackDiff?> = manifestDiffStore.pendingDiff
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
     init {
         load()
         observeUpdateProgress()
         checkSelfUpdateBanner()
+        refreshEmuHelperInstalled()
+        resolveDriverHints()
     }
 
     // ── Update actions ───────────────────────────────────────────────────────
 
-    /**
-     * Force re-check for all installed entries. Clears cached timing gate.
-     * Suitable for a "Check now" affordance in the header.
-     */
     fun checkForUpdates() {
         viewModelScope.launch {
             try {
@@ -161,10 +177,6 @@ class DashboardViewModel @Inject constructor(
         }
     }
 
-    /**
-     * Download + install all entries that currently have [UpdateInfo.hasUpdate] = true.
-     * Runs sequentially (PackageInstaller requires serial sessions).
-     */
     fun updateAll() {
         viewModelScope.launch {
             try {
@@ -175,11 +187,6 @@ class DashboardViewModel @Inject constructor(
         }
     }
 
-    /**
-     * Update a single entry via the update repository, tracking progress in
-     * [updateProgressMap]. Distinct from the legacy [update] path which uses
-     * the source router directly — repository path also updates persisted state.
-     */
     fun updateViaRepository(entryId: String) {
         viewModelScope.launch {
             try {
@@ -196,23 +203,16 @@ class DashboardViewModel @Inject constructor(
     private fun observeUpdateProgress() {
         viewModelScope.launch {
             updateRepository.updateProgressFlow.collect { progress ->
-                // All progress states (in-flight and terminal) simply update the map.
-                // Terminal states (Done/Cancelled/Failed) are added here and removed
-                // below after a short delay so the UI can render the final state briefly.
                 _updateProgressMap.update { current ->
                     current + (progress.entryId to progress)
                 }
 
-                // Clear terminal states after a short delay.
-                // Guard: only remove if the entry is still in a terminal state —
-                // a rapid re-update of the same entry within the 1.5s window would
-                // otherwise delete the NEW in-flight entry.
                 if (progress is UpdateProgress.Done ||
                     progress is UpdateProgress.Cancelled ||
                     progress is UpdateProgress.Failed
                 ) {
                     val id = progress.entryId
-                    kotlinx.coroutines.delay(1_500)
+                    delay(1_500)
                     _updateProgressMap.update { current ->
                         val cur = current[id]
                         if (cur is UpdateProgress.Done ||
@@ -221,7 +221,7 @@ class DashboardViewModel @Inject constructor(
                         ) {
                             current - id
                         } else {
-                            current  // a new in-flight update started — leave it alone
+                            current
                         }
                     }
                     refresh()
@@ -233,28 +233,23 @@ class DashboardViewModel @Inject constructor(
     // ── Self-update banner actions ────────────────────────────────────────────
 
     /**
-     * Launch the 24h-gated banner check on init. Silent: failures are swallowed
-     * because this runs in the background — the user didn't ask for it.
+     * Launch the 24h-gated banner check on init.
+     * FIX 5: log failures to Logcat so background issues are debuggable.
      */
     private fun checkSelfUpdateBanner() {
         viewModelScope.launch {
             try {
                 val result = selfUpdateRepository.bannerState()
-                // Only surface Available; UpToDate and Failed are silent on launch.
                 if (result is SelfUpdateResult.Available) {
                     _selfUpdate.value = result
                 }
-            } catch (_: Throwable) {
-                // Background check: swallow errors silently.
+            } catch (e: Throwable) {
+                // FIX 5: log background failures so they're visible in Logcat.
+                Log.d(TAG, "checkSelfUpdateBanner failed: ${e.message ?: e.javaClass.simpleName}", e)
             }
         }
     }
 
-    /**
-     * Persist [version] as the user's "skip this version" choice and clear the
-     * banner for this session. The 24h-gated [bannerState] will suppress this
-     * version on all future launch checks until a new release appears.
-     */
     fun skipSelfUpdate(version: String) {
         viewModelScope.launch {
             selfUpdateRepository.skipVersion(version)
@@ -263,18 +258,10 @@ class DashboardViewModel @Inject constructor(
         }
     }
 
-    /**
-     * Hide the banner for this session without persisting the skip. The banner
-     * will reappear on the next app launch (subject to the 24h gate).
-     */
     fun dismissSelfUpdateBanner() {
         _selfUpdate.value = null
     }
 
-    /**
-     * Open the "What's new" sheet for the current [SelfUpdateResult.Available].
-     * No-op if [selfUpdate] is not Available.
-     */
     fun openSelfUpdateSheet() {
         val available = _selfUpdate.value as? SelfUpdateResult.Available ?: return
         _selfUpdateSheet.value = SelfUpdateSheetUiState.Available(
@@ -286,28 +273,42 @@ class DashboardViewModel @Inject constructor(
     }
 
     /**
-     * Start downloading + installing the APK at [apkUrl]. Mirrors
-     * [AboutViewModel.downloadAndInstall]: stores the [Job] in
-     * [selfUpdateDownloadJob] so [dismissSelfUpdateSheet] can cancel it.
+     * Start downloading + installing the self-update APK.
+     *
+     * FIX 4 (throttle): progress emissions are throttled to ~200ms intervals so
+     * every 64 KB chunk doesn't re-compose the sheet (which re-parses markdown).
+     *
+     * FIX 4 (version-in-title): the Downloading state carries the version string
+     * so the title "What's new in vX" doesn't lose its version mid-download.
+     *
+     * FIX 4 (CancellationException): when the user dismisses the sheet mid-download
+     * the job is cancelled; we catch CancellationException and reset state silently
+     * instead of emitting a "Update failed" snackbar.
      */
     fun startSelfUpdateDownload(apkUrl: String) {
-        // Resolve sha256Url from the current sheet state while it's still Available.
-        val sha256Url = (_selfUpdateSheet.value as? SelfUpdateSheetUiState.Available)?.sha256Url
+        val currentSheet = _selfUpdateSheet.value as? SelfUpdateSheetUiState.Available ?: return
+        val sha256Url = currentSheet.sha256Url
+        val version = currentSheet.version
 
         selfUpdateDownloadJob = viewModelScope.launch {
             try {
+                var lastEmitMs = 0L
                 selfUpdateRepository.downloadAndInstall(apkUrl, sha256Url).collect { progress ->
                     when (progress) {
                         is ApkDownloader.Progress.Started ->
-                            _selfUpdateSheet.value = SelfUpdateSheetUiState.Downloading(0)
+                            _selfUpdateSheet.value = SelfUpdateSheetUiState.Downloading(0, version)
                         is ApkDownloader.Progress.Chunk -> {
-                            val pct = if (progress.totalBytes > 0L) {
-                                (progress.downloaded * 100 / progress.totalBytes).toInt()
-                            } else 0
-                            _selfUpdateSheet.value = SelfUpdateSheetUiState.Downloading(pct)
+                            // FIX 4 throttle: emit at most once per 200ms.
+                            val now = System.currentTimeMillis()
+                            if (now - lastEmitMs >= DOWNLOAD_EMIT_THROTTLE_MS) {
+                                lastEmitMs = now
+                                val pct = if (progress.totalBytes > 0L) {
+                                    (progress.downloaded * 100 / progress.totalBytes).toInt()
+                                } else 0
+                                _selfUpdateSheet.value = SelfUpdateSheetUiState.Downloading(pct, version)
+                            }
                         }
                         is ApkDownloader.Progress.Done -> {
-                            // System installer launched; close the sheet and clear the banner.
                             _selfUpdateSheet.value = null
                             _selfUpdate.value = null
                         }
@@ -315,16 +316,16 @@ class DashboardViewModel @Inject constructor(
                             _userMessage.emit("Update failed: ${progress.message}")
                     }
                 }
+            } catch (e: CancellationException) {
+                // FIX 4: user cancelled via dismissSelfUpdateSheet — reset state silently.
+                _selfUpdateSheet.value = null
+                throw e  // rethrow for structured concurrency
             } catch (e: Throwable) {
                 _userMessage.emit("Update failed: ${e.message ?: e.javaClass.simpleName}")
             }
         }
     }
 
-    /**
-     * Dismiss the self-update bottom sheet. Cancels any in-flight download so
-     * the system installer is never launched after the user walks away.
-     */
     fun dismissSelfUpdateSheet() {
         selfUpdateDownloadJob?.cancel()
         selfUpdateDownloadJob = null
@@ -333,9 +334,6 @@ class DashboardViewModel @Inject constructor(
 
     /**
      * UI state for the dashboard self-update bottom sheet.
-     *
-     * Mirrors [AboutViewModel.SelfUpdateUiState] but lives here so the
-     * dashboard doesn't depend on the About module.
      */
     sealed interface SelfUpdateSheetUiState {
         data class Available(
@@ -344,7 +342,8 @@ class DashboardViewModel @Inject constructor(
             val apkUrl    : String,
             val sha256Url : String?,
         ) : SelfUpdateSheetUiState
-        data class Downloading(val percent: Int) : SelfUpdateSheetUiState
+        // FIX 4: carry version into Downloading so the title stays correct.
+        data class Downloading(val percent: Int, val version: String) : SelfUpdateSheetUiState
     }
 
     // ── EmuHelper ────────────────────────────────────────────────────────────
@@ -370,56 +369,96 @@ class DashboardViewModel @Inject constructor(
         recommended = true,
     )
 
-    /** Whether EmuHelper is currently installed (queried on demand). */
-    fun isEmuHelperInstalled(): Boolean =
-        emuHelper.id in installed.snapshot()
+    /**
+     * FIX 5: refresh emuHelperInstalled off the main thread via coroutine.
+     * Called on init and on resume via [onResume].
+     */
+    private fun refreshEmuHelperInstalled() {
+        viewModelScope.launch {
+            installed.refresh()
+            _emuHelperInstalled.value = emuHelper.id in installed.snapshot()
+        }
+    }
 
-    /** Download + install the EmuHelper APK. Mirrors [update]'s APK path. */
+    /** Called by the screen on ON_RESUME to refresh installed state. */
+    fun onResume() {
+        refresh()
+        refreshEmuHelperInstalled()
+    }
+
+    // ── Driver hints / manifest diff ─────────────────────────────────────────
+
+    /**
+     * Resolve the GPU snapshot once (off the main thread via the suspend
+     * [GpuDetector.snapshot]) and recompute the per-emulator driver hints for
+     * the currently-loaded entries.
+     *
+     * For non-Adreno GPUs every [DriverHintProvider.hintFor] returns null, so
+     * the map stays empty and the UI renders no hint lines. The expensive EGL
+     * probe runs only once thanks to GpuDetector's internal cache.
+     */
+    private fun resolveDriverHints() {
+        viewModelScope.launch {
+            try {
+                gpuSnapshot = gpuDetector.snapshot()
+                recomputeDriverHints()
+            } catch (e: Throwable) {
+                Log.d(TAG, "resolveDriverHints failed: ${e.message ?: e.javaClass.simpleName}", e)
+            }
+        }
+    }
+
+    /**
+     * Rebuild [_driverHints] from the current entries and cached GPU snapshot.
+     * No-op (empty map) until the snapshot is resolved or when the GPU is not
+     * Adreno. Called after each [load] and once the snapshot lands.
+     */
+    private fun recomputeDriverHints() {
+        val gpu = gpuSnapshot ?: return
+        val entries = (_state.value as? UiState.Ready)?.entries ?: return
+        _driverHints.value = buildMap {
+            for (entry in entries) {
+                driverHintProvider.hintFor(entry.id, gpu)?.let { put(entry.id, it) }
+            }
+        }
+    }
+
+    /** Dismiss the manifest "what's new" banner. */
+    fun dismissPackDiff() {
+        viewModelScope.launch {
+            manifestDiffStore.clearPendingDiff()
+        }
+    }
+
+    /**
+     * FIX 5: installEmuHelper delegates to downloadAndInstall(emuHelper) so
+     * there is one shared download+install path instead of duplicated logic.
+     */
     fun installEmuHelper() {
         if (_emuHelperInstalling.value) return
         _emuHelperInstalling.value = true
         viewModelScope.launch {
             try {
-                val resolved = router.resolve(emuHelper)
-                if (resolved !is ResolveResult.Found) {
-                    _userMessage.emit("Install failed: could not resolve EmuHelper")
-                    return@launch
-                }
-                var file: File? = null
-                var downloadError: String? = null
-                downloader.download(resolved.apkUrl, resolved.filename).collect { p ->
-                    when (p) {
-                        is ApkDownloader.Progress.Done -> file = p.file
-                        is ApkDownloader.Progress.Failed -> downloadError = p.message
-                        else -> Unit
-                    }
-                }
-                if (downloadError != null) {
-                    _userMessage.emit("Install failed: $downloadError")
-                    return@launch
-                }
-                val f = file ?: run {
-                    _userMessage.emit("Install failed: download did not complete")
-                    return@launch
-                }
-                if (resolved.kind == AssetKind.APK) {
-                    installer.install(f)
-                    _userMessage.emit("Installed EmuHelper")
-                }
-            } catch (e: Throwable) {
-                _userMessage.emit("Install failed: ${e.message ?: e.javaClass.simpleName}")
+                downloadAndInstall(emuHelper)
             } finally {
                 _emuHelperInstalling.value = false
-                refresh()
             }
         }
     }
 
     // ── Lifecycle / data loading ─────────────────────────────────────────────
 
-    /** Public refresh — call from ON_RESUME. */
+    /**
+     * FIX 3b: debounced refresh — cancel the previous pending load and
+     * wait 50ms before launching a new one. Rapid successive calls (e.g. the
+     * N Done events from updateAll) coalesce into a single load().
+     */
     fun refresh() {
-        load()
+        refreshJob?.cancel()
+        refreshJob = viewModelScope.launch {
+            delay(REFRESH_DEBOUNCE_MS)
+            load()
+        }
     }
 
     private fun load() {
@@ -428,7 +467,8 @@ class DashboardViewModel @Inject constructor(
                 val dualScreen = setupOptions.isDualScreen.first()
                 val entries = withContext(Dispatchers.IO) {
                     val all = if (dualScreen) parser.loadDualScreen() else parser.loadStandard()
-                    all.filterNot { it.id == "904332840" }
+                    // FIX 5: use the constant instead of the inline "904332840" string.
+                    all.filterNot { it.id == ObtainiumPackParser.OBTAINIUM_META_ENTRY_ID }
                 }
                 val installedNow = installed.snapshot()
                 val (have, dont) = entries.partition { it.id in installedNow }
@@ -441,23 +481,19 @@ class DashboardViewModel @Inject constructor(
                         installedIds = installedNow,
                     )
                 }
+                // Keep driver hints in sync with the freshly-loaded entry set.
+                recomputeDriverHints()
             } catch (t: Throwable) {
                 _state.update { UiState.Failed(t.message ?: t.javaClass.simpleName) }
             }
         }
     }
 
-    // ── Per-app actions (legacy path — direct source router) ─────────────────
+    // ── Per-app actions ──────────────────────────────────────────────────────
 
     /**
-     * Download + install a single entry (used for AvailableCard "Install" action
-     * and any fresh-install path). Does NOT go through [UpdateRepository], so the
-     * persisted update badge is NOT cleared — for installed apps whose badge must
-     * clear, use [updateViaRepository] instead (FIX 3 / FIX 4).
-     *
-     * Renamed from `update` to `downloadAndInstall` to remove the misleading
-     * "update" naming — this function performs download+install regardless of
-     * whether a newer version actually exists.
+     * Download + install a single entry. Used for AvailableCard "Install"
+     * and as the shared path for [installEmuHelper] (FIX 5).
      */
     fun downloadAndInstall(entry: AppEntry) {
         if (entry.id in _busy.value) return
@@ -477,8 +513,6 @@ class DashboardViewModel @Inject constructor(
                 downloader.download(resolved.apkUrl, resolved.filename).collect { p ->
                     when (p) {
                         is ApkDownloader.Progress.Done -> file = p.file
-                        // FIX 5: surface the real downloader failure message instead of
-                        // the generic "download did not complete" fallback.
                         is ApkDownloader.Progress.Failed -> downloadError = p.message
                         else -> Unit
                     }
@@ -494,9 +528,6 @@ class DashboardViewModel @Inject constructor(
 
                 when (resolved.kind) {
                     io.github.mayusi.emutran.data.source.AssetKind.DRIVER_ZIP -> {
-                        // FIX 2: use the shared resolveTurnipDir helper so rootPath
-                        // values that already end in "/Emulation" don't produce the
-                        // double-suffix path .../Emulation/Emulation/tools/turnip.
                         val turnipDir = resolveTurnipDir(rootPath).apply { mkdirs() }
                         f.copyTo(File(turnipDir, f.name), overwrite = true)
                         _userMessage.emit("Installed ${entry.name}")
@@ -532,5 +563,13 @@ class DashboardViewModel @Inject constructor(
             val installedIds: Set<String>,
         ) : UiState
         data class Failed(val message: String) : UiState
+    }
+
+    companion object {
+        private const val TAG = "DashboardViewModel"
+        /** Debounce window for refresh() calls: 50ms. */
+        private const val REFRESH_DEBOUNCE_MS = 50L
+        /** Minimum interval between Downloading state emissions: ~200ms. */
+        private const val DOWNLOAD_EMIT_THROTTLE_MS = 200L
     }
 }

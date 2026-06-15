@@ -22,8 +22,12 @@ import io.github.mayusi.emutran.domain.drivers.DriverStager
 import io.github.mayusi.emutran.domain.install.InstallResult
 import io.github.mayusi.emutran.domain.install.InstallerRouter
 import io.github.mayusi.emutran.domain.scaffold.FolderSpec
+import io.github.mayusi.emutran.domain.scaffold.resolveTurnipDir   // FIX 5
 import io.github.mayusi.emutran.service.SetupForegroundService
+import io.github.mayusi.emutran.service.SetupServiceBridge          // FIX 4
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -69,6 +73,7 @@ class ProgressViewModel @Inject constructor(
     private val driverStager: DriverStager,
     private val setupOptions: SetupOptionsStore,
     private val networkChecker: NetworkChecker,
+    private val bridge: SetupServiceBridge,             // FIX 4
 ) : ViewModel() {
 
     private val _state = MutableStateFlow<State>(State.Idle)
@@ -83,6 +88,13 @@ class ProgressViewModel @Inject constructor(
     private var retrying = false
 
     /**
+     * FIX 2: holds the coroutine running [runPipeline] so we can cancel it
+     * from [cancelAndReset] and [retryAll] without waiting for the viewModelScope
+     * to be cleared. Nulled after the job completes or is cancelled.
+     */
+    private var pipelineJob: Job? = null
+
+    /**
      * Non-null while the pipeline is suspended waiting for the user to
      * decide whether to continue without a network connection.
      * Resolved by [confirmOffline]; completing with `true` proceeds to the
@@ -94,46 +106,72 @@ class ProgressViewModel @Inject constructor(
      * Called by [ProgressScreen] when the user taps "Continue anyway" or
      * "Cancel" on the offline pre-flight dialog.
      *
+     * FIX 2: guard against a stale / already-completed deferred — if the
+     * pipeline was cancelled while we were suspended at OfflineWarning, the
+     * deferred will have been cancelled already and this is a no-op.
+     *
      * @param continueAnyway true → proceed with downloads (they will fail per-app,
      *   existing error handling in processEntries() applies); false → skip the
      *   download/install phases and go directly to a Done state showing folders built.
      */
     fun confirmOffline(continueAnyway: Boolean) {
-        offlineDecision?.complete(continueAnyway)
+        offlineDecision?.takeIf { !it.isCompleted }?.complete(continueAnyway)
     }
 
     fun start() {
         if (_state.value !is State.Idle) return
         startSetupService()
-        viewModelScope.launch { runPipeline() }
+        pipelineJob = viewModelScope.launch { runPipeline() }   // FIX 2
     }
 
     /**
      * Reset to Idle and re-run the full pipeline from scratch.
-     * Used by the Failed-state "Retry" button in ProgressScreen (FIX 3).
+     * Used by the Failed-state "Retry" button in ProgressScreen.
+     *
+     * FIX 2: cancel the previous pipeline job before launching a new one
+     * so no zombie coroutine lingers.
      */
     fun retryAll() {
         if (_state.value is State.Idle) return
+        // FIX 2: kill the old pipeline (and any suspended offlineDecision).
+        cancelPipelineJob()
         _state.update { State.Idle }
+        bridge.mutable.value = State.Idle                        // FIX 4
         startSetupService()
-        viewModelScope.launch { runPipeline() }
+        pipelineJob = viewModelScope.launch { runPipeline() }   // FIX 2
     }
 
     /**
-     * Reset to Idle without re-launching the pipeline.
-     * Used by the BackHandler cancel dialog (FIX 6) — the user wants to
-     * abandon the run and return to the dashboard; we just need the state
-     * machine back at Idle so the service stops and no ghost job lingers.
-     * The service observes State.Done/Failed to stop itself; for a
-     * user-initiated cancel we emit Idle which is also non-running —
-     * the service's collect loop will not call stopSelf() but the
-     * service will be destroyed by Android when the process is no longer
-     * in the foreground. The state change still cuts off any in-flight
-     * coroutine by the ViewModel being destroyed when the composable
-     * leaves the back-stack, so this is safe.
+     * Cancel the running pipeline and emit [State.Cancelled] so the service
+     * stops immediately.
+     *
+     * FIX 1: emit Cancelled (a proper terminal state) instead of Idle so
+     * [SetupForegroundService] calls stopSelf() and dismisses the notification.
+     *
+     * FIX 2: cancel [pipelineJob] and clean up [offlineDecision] before
+     * emitting the terminal state so no zombie coroutine can resurrect the
+     * pipeline later.
+     *
+     * The call site in [ProgressScreen]'s cancel dialog calls [onGoToDashboard]
+     * immediately after this — that navigation still works regardless of state.
      */
     fun cancelAndReset() {
-        _state.update { State.Idle }
+        cancelPipelineJob()                         // FIX 2
+        _state.update { State.Cancelled }
+        bridge.mutable.value = State.Cancelled      // FIX 4
+    }
+
+    /**
+     * FIX 2 helper: cancel the running pipeline job and discard any pending
+     * offline decision so confirmOffline() can't resurrect a dead pipeline.
+     */
+    private fun cancelPipelineJob() {
+        pipelineJob?.cancel()
+        pipelineJob = null
+        // Cancel or complete the deferred so the suspended coroutine
+        // (already cancelled via pipelineJob.cancel()) is properly cleaned up.
+        offlineDecision?.cancel()
+        offlineDecision = null
     }
 
     /**
@@ -141,6 +179,9 @@ class ProgressViewModel @Inject constructor(
      * failed last time. Newly-succeeded entries move to the installed
      * list; entries that still fail stay in failed. Does not re-scaffold
      * folders or re-stage drivers — those already ran.
+     *
+     * FIX 3: added catch for non-cancellation exceptions so a crash in
+     * [finishWithDrivers] doesn't silently leave the service running forever.
      */
     fun retryFailed() {
         if (retrying) return
@@ -162,13 +203,38 @@ class ProgressViewModel @Inject constructor(
                     skipped = lastSkipped,
                     failures = result.failures,
                 )
+            } catch (t: Throwable) {
+                // FIX 3: rethrow CancellationException so structured concurrency
+                // is not broken; emit Failed for everything else so the service
+                // gets a terminal state and can stop itself.
+                if (t is CancellationException) throw t
+                emitState(State.Failed(t.message ?: "Unexpected error during retry", emptyList()))
             } finally {
                 retrying = false
             }
         }
     }
 
+    // ---- internal helpers ----
+
+    /** Emit to both the VM's own flow and the bridge simultaneously. */
+    private fun emitState(s: State) {
+        _state.update { s }
+        bridge.mutable.value = s
+    }
+
     private suspend fun runPipeline() {
+        try {
+            runPipelineInternal()
+        } catch (t: Throwable) {
+            // FIX 3 coverage for runPipeline: propagate cancellation, surface
+            // everything else as a Failed terminal state so the service stops.
+            if (t is CancellationException) throw t
+            emitState(State.Failed(t.message ?: "Unexpected pipeline error", emptyList()))
+        }
+    }
+
+    private suspend fun runPipelineInternal() {
         // --- Phase 1: scaffold ---
         val rootPath = store.rootPath.first() ?: store.defaultPath
         // Pass the PARENT of Emulation/ as the builder root, because
@@ -184,20 +250,18 @@ class ProgressViewModel @Inject constructor(
         }
         var foldersDone = 0
         var foldersTotal = FolderSpec.tree.size + FolderSpec.biosReadmes.size
-        _state.update {
-            State.Scaffolding(0, foldersTotal, "Building folder structure…")
-        }
+        emitState(State.Scaffolding(0, foldersTotal, "Building folder structure…"))
         builder.build(builderRoot, FolderSpec.tree, FolderSpec.biosReadmes).collect { p ->
             when (p) {
                 is FileFolderBuilder.Progress.Started ->
                     foldersTotal = p.total
                 is FileFolderBuilder.Progress.Step -> {
                     foldersDone = p.done
-                    _state.update { State.Scaffolding(foldersDone, p.total, p.label) }
+                    emitState(State.Scaffolding(foldersDone, p.total, p.label))
                 }
                 is FileFolderBuilder.Progress.Finished -> Unit
                 is FileFolderBuilder.Progress.Failed -> {
-                    _state.update { State.Failed(p.message, emptyList()) }
+                    emitState(State.Failed(p.message, emptyList()))
                     return@collect
                 }
             }
@@ -238,7 +302,10 @@ class ProgressViewModel @Inject constructor(
         if (toProcess.isNotEmpty() && !networkChecker.isOnline()) {
             val decision = CompletableDeferred<Boolean>()
             offlineDecision = decision
-            _state.update { State.OfflineWarning }
+            emitState(State.OfflineWarning)
+            // FIX 2: if the coroutine is cancelled while suspended here,
+            // CancellationException propagates up through await() — that's
+            // the correct structured-concurrency behaviour.
             val continueAnyway = decision.await()
             offlineDecision = null
             if (!continueAnyway) {
@@ -309,9 +376,7 @@ class ProgressViewModel @Inject constructor(
         val resolveSemaphore = Semaphore(permits = RESOLVE_CONCURRENCY)
         val doneCount = AtomicInteger(0)
 
-        _state.update {
-            State.Resolving(done = 0, total = entries.size, currentApp = "")
-        }
+        emitState(State.Resolving(done = 0, total = entries.size, currentApp = ""))
 
         // Launch all resolves concurrently under a shared scope so failures in
         // one don't cancel others — they just record into fail(). coroutineScope
@@ -323,13 +388,13 @@ class ProgressViewModel @Inject constructor(
                     resolveSemaphore.withPermit {
                         val r = router.resolve(entry)
                         val n = doneCount.incrementAndGet()
-                        _state.update {
+                        emitState(
                             State.Resolving(
                                 done = n,
                                 total = entries.size,
                                 currentApp = entry.name,
                             )
-                        }
+                        )
                         ResolveOutcome(entry, r)
                     }
                 }
@@ -359,7 +424,7 @@ class ProgressViewModel @Inject constructor(
         )
         val downloaded = mutableListOf<Downloaded>()
         for ((index, item) in resolved.withIndex()) {
-            _state.update {
+            emitState(
                 State.Downloading(
                     done = index,
                     total = resolved.size,
@@ -367,7 +432,7 @@ class ProgressViewModel @Inject constructor(
                     currentBytes = 0L,
                     currentTotalBytes = item.info.sizeBytes ?: 0L,
                 )
-            }
+            )
             var apkFile: File? = null
             // FIX 1 (SHA-256 sidecar): if the source found a sidecar asset, fetch the hash
             // now and pass it to the downloader for post-download verification.
@@ -383,7 +448,7 @@ class ProgressViewModel @Inject constructor(
             } else {
                 null  // No sidecar published for this release; download proceeds unverified.
             }
-            // FIX 1 (throttle): track last time we emitted a Chunk-based state update.
+            // Throttle: track last time we emitted a Chunk-based state update.
             // A 100 MB APK at 64 KB chunks = ~1 600 events; throttling to 200 ms cuts
             // that to ~5 updates/sec while still showing real-time progress.
             var lastEmitMs = 0L
@@ -391,14 +456,14 @@ class ProgressViewModel @Inject constructor(
                 when (p) {
                     is ApkDownloader.Progress.Started ->
                         // Always emit Started immediately — this is the initial state transition.
-                        _state.update {
+                        emitState(
                             State.Downloading(
                                 done = index, total = resolved.size,
                                 currentApp = item.entry.name,
                                 currentBytes = 0L,
                                 currentTotalBytes = p.totalBytes,
                             )
-                        }
+                        )
                     is ApkDownloader.Progress.Chunk -> {
                         // Throttle: emit at most once per 200 ms, OR when the download
                         // is complete (downloaded == totalBytes) so the UI always shows 100%.
@@ -406,14 +471,14 @@ class ProgressViewModel @Inject constructor(
                         val isFinal = p.totalBytes > 0L && p.downloaded >= p.totalBytes
                         if (isFinal || (now - lastEmitMs) >= 200L) {
                             lastEmitMs = now
-                            _state.update {
+                            emitState(
                                 State.Downloading(
                                     done = index, total = resolved.size,
                                     currentApp = item.entry.name,
                                     currentBytes = p.downloaded,
                                     currentTotalBytes = p.totalBytes,
                                 )
-                            }
+                            )
                         }
                     }
                     is ApkDownloader.Progress.Done -> apkFile = p.file
@@ -435,18 +500,20 @@ class ProgressViewModel @Inject constructor(
         //                  emulator's Custom Driver setting.
         val isSilent = installer.currentMode() == io.github.mayusi.emutran
             .domain.install.InstallerRouter.Mode.SHIZUKU_SILENT
+        // FIX 5: delegate to EmulationPaths.resolveTurnipDir instead of the
+        // inline private copy — single source of truth.
         val turnipDir = resolveTurnipDir(rootPath).apply { mkdirs() }
         val installedNames = mutableListOf<String>()
         val cancelledNames = mutableListOf<String>()
         for ((index, item) in downloaded.withIndex()) {
-            _state.update {
+            emitState(
                 State.Installing(
                     done = index,
                     total = downloaded.size,
                     currentApp = item.entry.name,
                     silent = isSilent,
                 )
-            }
+            )
             when (item.kind) {
                 io.github.mayusi.emutran.data.source.AssetKind.DRIVER_ZIP -> {
                     // Copy the zip into tools/turnip/ — overwrite if it
@@ -502,14 +569,14 @@ class ProgressViewModel @Inject constructor(
         // shouldn't auto-run for everyone.
         val wantDrivers = setupOptions.stageGpuDrivers.first()
         if (!wantDrivers) {
-            _state.update {
+            emitState(
                 State.Done(
                     installed = installedNames,
                     skipped = skipped,
                     failed = failures,
                     drivers = DriverSummary.Skipped("Not enabled"),
                 )
-            }
+            )
             return
         }
 
@@ -521,12 +588,13 @@ class ProgressViewModel @Inject constructor(
             is DriverStager.DiscoverResult.Failed ->
                 driverSummary = DriverSummary.Failed(discover.reason)
             is DriverStager.DiscoverResult.Found -> {
-                _state.update {
+                emitState(
                     State.StagingDrivers(
                         releaseTag = discover.releaseTag,
                         assetCount = discover.assets.size,
                     )
-                }
+                )
+                // FIX 5: use EmulationPaths.resolveTurnipDir.
                 val turnipDir = resolveTurnipDir(rootPath)
                 val stage = driverStager.stage(discover.assets, turnipDir)
                 driverSummary = when (stage) {
@@ -542,43 +610,32 @@ class ProgressViewModel @Inject constructor(
             }
         }
 
-        _state.update {
+        emitState(
             State.Done(
                 installed = installedNames,
                 skipped = skipped,
                 failed = failures,
                 drivers = driverSummary,
             )
-        }
-    }
-
-    /**
-     * Registers this ViewModel's state flow with [SetupForegroundService]
-     * and starts the service. The service watches the flow and stops itself
-     * when it sees [State.Done] or [State.Failed], so no explicit stop call
-     * is needed from the ViewModel side.
-     */
-    private fun startSetupService() {
-        SetupForegroundService.pendingStateFlow = _state
-        context.startForegroundService(
-            Intent(context, SetupForegroundService::class.java)
         )
     }
 
     /**
-     * Turnip dir = <root>/Emulation/tools/turnip — BUT if the user
-     * already picked a folder named "Emulation" (legacy SAF setup or
-     * a deliberate pick), don't double up and create
-     * Emulation/Emulation/tools/turnip.
+     * Registers this ViewModel's state with [SetupServiceBridge] and starts
+     * the service. The service watches the bridge flow and stops itself when
+     * it sees a terminal state (Done, Failed, Cancelled).
+     *
+     * FIX 4: no longer sets a static var on the service companion object.
+     * The bridge is a @Singleton shared between this VM and the service via
+     * Hilt injection.
      */
-    private fun resolveTurnipDir(rootPath: String): File {
-        val rootFile = File(rootPath)
-        val emulationRoot = if (rootFile.name.equals("Emulation", ignoreCase = true)) {
-            rootFile
-        } else {
-            File(rootFile, "Emulation")
-        }
-        return File(emulationRoot, "tools/turnip")
+    private fun startSetupService() {
+        // Sync the bridge before starting the service so the service sees
+        // the current state immediately on onStartCommand.
+        bridge.mutable.value = _state.value
+        context.startForegroundService(
+            Intent(context, SetupForegroundService::class.java)
+        )
     }
 
     sealed interface State {
@@ -632,6 +689,18 @@ class ProgressViewModel @Inject constructor(
             val message: String,
             val partial: List<String>,
         ) : State
+
+        /**
+         * FIX 1: emitted by [cancelAndReset] when the user explicitly cancels
+         * the setup run. This is a proper terminal state so [SetupForegroundService]
+         * calls [android.app.Service.stopSelf] and dismisses the notification
+         * immediately, instead of leaving a stale "Setting up…" entry in the shade.
+         *
+         * [ProgressScreen] does not need to render this state — the cancel dialog
+         * calls [cancelAndReset] and then immediately invokes [onGoToDashboard], so
+         * the composable is already navigating away when Cancelled is emitted.
+         */
+        data object Cancelled : State
     }
 
     companion object {

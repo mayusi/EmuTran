@@ -58,6 +58,9 @@ class UpdateNotifier @Inject constructor(
      *
      * Does nothing if POST_NOTIFICATIONS is not granted on API 33+.
      */
+    // canPostNotifications() does the actual POST_NOTIFICATIONS checkSelfPermission
+    // guard for API 33+; lint can't trace the check through the helper, so suppress.
+    @android.annotation.SuppressLint("MissingPermission")
     fun notifyUpdatesAvailable(count: Int, sampleNames: List<String>) {
         if (count <= 0) return
         if (!canPostNotifications()) return

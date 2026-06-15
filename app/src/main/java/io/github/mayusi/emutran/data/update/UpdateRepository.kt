@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import dagger.hilt.android.qualifiers.ApplicationContext
+import io.github.mayusi.emutran.data.device.InstalledAppsRegistry
 import io.github.mayusi.emutran.data.manifest.ObtainiumPackParser
 import io.github.mayusi.emutran.data.source.AppSourceRouter
 import io.github.mayusi.emutran.data.source.ResolveResult
@@ -18,7 +19,9 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -69,6 +72,9 @@ class UpdateRepository @Inject constructor(
     private val installer: InstallerRouter,
     private val store: UpdateStateStore,
     private val setupOptions: SetupOptionsStore,
+    // FIX 3a: inject InstalledAppsRegistry so we use its cached PM snapshot
+    // instead of doing N full scans per check cycle.
+    private val installedAppsRegistry: InstalledAppsRegistry,
 ) {
 
     // ── Public: observable state ───────────────────────────────────────────
@@ -121,23 +127,37 @@ class UpdateRepository @Inject constructor(
      *   re-checks every entry even if recently checked (used by "Check now"
      *   button). When false (background worker), entries checked < 6h ago
      *   are skipped.
+     *
+     * FIX 1b: all results are collected in-memory and written to DataStore in
+     * ONE transaction at the end (via [UpdateStateStore.putAllUpdateInfo]),
+     * producing 1 DataStore emission instead of N. This eliminates the
+     * O(n²) re-decode of all entry blobs on every single write.
+     *
+     * FIX 3a: uses [InstalledAppsRegistry.snapshot] for the installed-package
+     * set, then performs ONE additional PM query for versionCode/versionName on
+     * only the matching packages — avoiding N full PM scans per check.
      */
     suspend fun checkNow(force: Boolean = false) = withContext(Dispatchers.IO) {
         val entries = loadManifestEntries()
-        val installedMap = installedPackages()
+
+        // FIX 3a: use the registry's cached Set<String> to find which entries
+        // are installed, then do a single targeted PM query for versionCode/Name.
+        val installedPackageNames = installedAppsRegistry.snapshot()
+        val installedInfoMap = queryVersionInfoForPackages(installedPackageNames)
 
         // Only check entries that are actually installed and have a real package id.
         val candidates = entries.filter { entry ->
-            entry.id in installedMap && !entry.trackOnly
+            entry.id in installedPackageNames && !entry.trackOnly
         }
 
         // Semaphore caps simultaneous in-flight API calls.
         val semaphore = Semaphore(MAX_CONCURRENT_RESOLVES)
         val nowMs = System.currentTimeMillis()
 
-        // Run each check in parallel within the semaphore bound.
-        // coroutineScope provides a structured scope for async launches so
-        // we don't need a standalone CoroutineScope (avoids lifecycle leaks).
+        // FIX 1b: collect all results in-memory first.
+        val pendingWrites = mutableListOf<UpdateStateStore.PersistedUpdateInfo>()
+        val pendingWritesMutex = Mutex()
+
         coroutineScope {
             val jobs = candidates.map { entry ->
                 async(Dispatchers.IO) {
@@ -150,7 +170,7 @@ class UpdateRepository @Inject constructor(
                             if (ageMs < CHECK_INTERVAL_MS) return@withPermit
                         }
 
-                        val pkgInfo = installedMap[entry.id]
+                        val pkgInfo = installedInfoMap[entry.id]
                         val installedVersionCode = pkgInfo?.longVersionCode ?: -1L
                         val installedVersionName = pkgInfo?.versionName ?: ""
 
@@ -163,30 +183,27 @@ class UpdateRepository @Inject constructor(
                             else -> persisted?.availableVersion // keep last known on failure
                         }
 
-                        store.putUpdateInfo(
-                            UpdateStateStore.PersistedUpdateInfo(
-                                entryId = entry.id,
-                                installedVersionCode = installedVersionCode,
-                                installedVersionName = installedVersionName,
-                                availableVersion = availableVersion,
-                                lastCheckedEpoch = nowMs,
-                            )
+                        val info = UpdateStateStore.PersistedUpdateInfo(
+                            entryId = entry.id,
+                            installedVersionCode = installedVersionCode,
+                            installedVersionName = installedVersionName,
+                            availableVersion = availableVersion,
+                            lastCheckedEpoch = nowMs,
                         )
+                        pendingWritesMutex.withLock { pendingWrites.add(info) }
                     }
                 }
             }
             jobs.forEach { it.await() }
         }
+
+        // FIX 1b: ONE DataStore transaction writes all entries — 1 emission, not N.
+        store.putAllUpdateInfo(pendingWrites)
     }
 
     /**
      * Download and install the latest version of a single entry.
      * Progress events are emitted to [updateProgressFlow].
-     *
-     * This is a suspend fun rather than a Flow because the install step is
-     * inherently sequential (one PackageInstaller session at a time);
-     * callers can launch it in a coroutine scope and subscribe to
-     * [updateProgressFlow] for live updates.
      */
     suspend fun updateOne(entryId: String) = withContext(Dispatchers.IO) {
         val entries = loadManifestEntries()
@@ -213,12 +230,33 @@ class UpdateRepository @Inject constructor(
             return@withContext
         }
 
+        // FIX 1 (SHA-256 sidecar): resolved.sha256 is always null (sources only set
+        // sha256Url), so passing it left updates installing UNVERIFIED. Mirror the
+        // SETUP path (ProgressViewModel): when the source published a sidecar, fetch
+        // the hash now and treat a fetch failure as a HARD error — never install
+        // without the integrity check. When no sidecar exists, proceed unverified.
+        val expectedSha256: String? = if (resolved.sha256Url != null) {
+            val hash = sourceRouter.fetchSha256Sidecar(resolved.sha256Url)
+            if (hash == null) {
+                updateProgressFlow.emit(
+                    UpdateProgress.Failed(
+                        entryId,
+                        "SHA-256 sidecar fetch failed — refusing to download without integrity check"
+                    )
+                )
+                return@withContext
+            }
+            hash
+        } else {
+            null  // No sidecar published for this release; download proceeds unverified.
+        }
+
         // Download phase — forward each chunk to the shared progress flow.
         var downloadedFile: File? = null
         downloader.download(
             url = resolved.apkUrl,
             filename = resolved.filename,
-            expectedSha256 = resolved.sha256,
+            expectedSha256 = expectedSha256,
         ).collect { progress ->
             when (progress) {
                 is ApkDownloader.Progress.Started ->
@@ -248,14 +286,19 @@ class UpdateRepository @Inject constructor(
 
         when (installResult) {
             is InstallResult.Installed -> {
-                // Refresh stored version data so the badge clears immediately.
-                val pkgInfo = installedPackages()[entryId]
+                // FIX 3a: refresh the registry then snapshot for just this package
+                // instead of doing a full PM scan (installedPackages() call removed).
+                installedAppsRegistry.refresh()
                 val currentInfo = store.getUpdateInfo(entryId)
-                if (currentInfo != null && pkgInfo != null) {
+                if (currentInfo != null) {
+                    // Re-query PM for the newly-installed version of this one package.
+                    val freshPkgInfo = querySinglePackage(entryId)
                     store.putUpdateInfo(
                         currentInfo.copy(
-                            installedVersionCode = pkgInfo.longVersionCode,
-                            installedVersionName = pkgInfo.versionName ?: "",
+                            installedVersionCode = freshPkgInfo?.longVersionCode
+                                ?: currentInfo.installedVersionCode,
+                            installedVersionName = freshPkgInfo?.versionName
+                                ?: currentInfo.installedVersionName,
                             // Keep availableVersion so UI can show "up to date" label
                         )
                     )
@@ -269,15 +312,26 @@ class UpdateRepository @Inject constructor(
         }
     }
 
+    // FIX 3b: guard updateAll() against concurrent invocation.
+    private val updateAllMutex = Mutex()
+
     /**
      * Update all entries that currently have [UpdateInfo.hasUpdate] = true.
      * Runs installs sequentially (PackageInstaller requires serial sessions).
+     *
+     * FIX 3b: a Mutex prevents double-invocation (e.g. double-tap on
+     * "Update all"). If already running, the new call returns immediately.
      */
     suspend fun updateAll() {
-        val pending = updateState().first()
-            .values.filter { it.hasUpdate }.map { it.entryId }
-        for (id in pending) {
-            updateOne(id)
+        if (!updateAllMutex.tryLock()) return  // already running — skip
+        try {
+            val pending = updateState().first()
+                .values.filter { it.hasUpdate }.map { it.entryId }
+            for (id in pending) {
+                updateOne(id)
+            }
+        } finally {
+            updateAllMutex.unlock()
         }
     }
 
@@ -294,8 +348,13 @@ class UpdateRepository @Inject constructor(
             packParser.loadStandard()
         }
 
-    /** Map of package name → [PackageInfo] for all installed packages. */
-    private fun installedPackages(): Map<String, PackageInfo> {
+    /**
+     * FIX 3a: Query the PM for only the packages that match the installed
+     * set. Returns a Map<packageName, PackageInfo> with versionCode + name.
+     * Does ONE PM scan and filters — far cheaper than scanning all packages
+     * twice (once for names, once per-entry inside updateOne).
+     */
+    private fun queryVersionInfoForPackages(packageNames: Set<String>): Map<String, PackageInfo> {
         val pm = context.packageManager
         return try {
             val list: List<PackageInfo> = if (android.os.Build.VERSION.SDK_INT >= 33) {
@@ -304,24 +363,36 @@ class UpdateRepository @Inject constructor(
                 @Suppress("DEPRECATION")
                 pm.getInstalledPackages(0)
             }
-            list.associateBy { it.packageName }
+            list.filter { it.packageName in packageNames }.associateBy { it.packageName }
         } catch (_: Throwable) {
             emptyMap()
         }
     }
 
+    /** Query PM for a single package (used after a successful install). */
+    private fun querySinglePackage(packageName: String): PackageInfo? {
+        return try {
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                context.packageManager.getPackageInfo(
+                    packageName,
+                    PackageManager.PackageInfoFlags.of(0)
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                context.packageManager.getPackageInfo(packageName, 0)
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     /**
      * Returns true when the source reported a version that is different from
-     * the last version we recorded as installed. We use string inequality on
-     * the version tag because numeric versionCode is unreliable across forks
-     * (e.g. Winlator forks may reset their versionCode counter). A mismatch
-     * is a probable update; it could also be a downgrade, but the system
-     * installer will tell the user in that case.
+     * the last version we recorded as installed.
      */
-    private fun computeHasUpdate(info: UpdateStateStore.PersistedUpdateInfo): Boolean {
+    internal fun computeHasUpdate(info: UpdateStateStore.PersistedUpdateInfo): Boolean {
         if (info.installedVersionCode < 0) return false       // not installed
         val available = info.availableVersion ?: return false  // not yet checked
-        // If the available tag differs from the installed versionName, flag it.
         return available.trimStart('v', 'V') != info.installedVersionName.trimStart('v', 'V')
     }
 
@@ -330,20 +401,16 @@ class UpdateRepository @Inject constructor(
         const val CHECK_INTERVAL_MS: Long = 6 * 60 * 60 * 1_000L
 
         /**
-         * Maximum simultaneous source API calls. Keeps us comfortably under
-         * GitHub's 60-req/hr unauthenticated limit even without ETags.
+         * Maximum simultaneous source API calls.
          */
         private const val MAX_CONCURRENT_RESOLVES = 4
     }
 }
 
-// ── Public model types ─────────────────────────────────────────────────────
+// ── Public model types ─────────────────────────────────────────────────────────
 
 /**
- * Runtime view of one entry's update state. Built from [UpdateStateStore.PersistedUpdateInfo]
- * each time [UpdateRepository.updateState] emits.
- *
- * UI agents receive this via the Flow; they never construct it themselves.
+ * Runtime view of one entry's update state.
  */
 data class UpdateInfo(
     val entryId: String,

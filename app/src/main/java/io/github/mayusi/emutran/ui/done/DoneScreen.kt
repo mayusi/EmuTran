@@ -15,7 +15,6 @@ import androidx.compose.material.icons.outlined.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -26,7 +25,6 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
-import io.github.mayusi.emutran.BuildConfig
 import io.github.mayusi.emutran.R
 import io.github.mayusi.emutran.ui.common.Dimens
 import io.github.mayusi.emutran.ui.common.dpadFocusBorder
@@ -57,7 +55,6 @@ import io.github.mayusi.emutran.ui.theme.EmuTones
 fun DoneScreen(
     success: Boolean = true,
     onGoToDashboard: () -> Unit = {},
-    onTestInstall: () -> Unit = {},
 ) {
     // D-pad: land on the primary action (Go to Dashboard) immediately.
     val dashboardFocus = remember { FocusRequester() }
@@ -150,20 +147,5 @@ fun DoneScreen(
                 .dpadFocusBorder(dashboardInteraction, cornerRadius = 50.dp),
         ) { Text("Go to Dashboard") }
 
-        // ── Debug-only install pipeline test ──────────────────────────────
-        // Hidden in release APKs so end users never see it. Kept around because
-        // it's a quick way to validate the install path in isolation when
-        // something downstream of the picker breaks.
-        if (BuildConfig.DEBUG) {
-            val devInteraction = remember { MutableInteractionSource() }
-            OutlinedButton(
-                onClick = onTestInstall,
-                interactionSource = devInteraction,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = Dimens.ButtonMinHeight)
-                    .dpadFocusBorder(devInteraction, cornerRadius = 50.dp),
-            ) { Text("Dev: test download + install") }
-        }
     }
 }

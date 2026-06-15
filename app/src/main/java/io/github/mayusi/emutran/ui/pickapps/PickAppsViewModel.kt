@@ -75,9 +75,13 @@ class PickAppsViewModel @Inject constructor(
                 val dualScreen = setupOptions.isDualScreen.first()
                 val entries = withContext(Dispatchers.IO) {
                     if (dualScreen) parser.loadDualScreen() else parser.loadStandard()
-                }.filterNot { it.id == "904332840" } // Obtainium pack meta
+                // FIX #6: use the constant instead of the inline string.
+                }.filterNot { it.id == ObtainiumPackParser.OBTAINIUM_META_ENTRY_ID }
 
-                refreshInstalled()
+                // Inline refresh here (already inside a coroutine) so the
+                // snapshot read on the next line is guaranteed to be fresh.
+                installedApps.refresh()
+                _installed.update { installedApps.snapshot() }
                 val alreadyHere = _installed.value
                 // Pre-check recommended entries that the user does NOT
                 // already have — no point pre-selecting Flycast when
@@ -94,9 +98,18 @@ class PickAppsViewModel @Inject constructor(
         }
     }
 
-    /** Re-query installed packages. Call from screen ON_RESUME. */
+    /**
+     * Re-query installed packages. Call from screen ON_RESUME.
+     *
+     * FIX #5: launch on viewModelScope so the IO-dispatched refresh()
+     * never blocks the main thread. snapshot() is called after refresh()
+     * returns, guaranteeing the cache is warm and the read is instant.
+     */
     fun refreshInstalled() {
-        _installed.update { installedApps.snapshot() }
+        viewModelScope.launch {
+            installedApps.refresh()
+            _installed.update { installedApps.snapshot() }
+        }
     }
 
     fun toggle(entryId: String) {

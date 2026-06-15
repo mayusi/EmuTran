@@ -6,7 +6,10 @@ import android.net.Uri
 import androidx.core.content.FileProvider
 import dagger.hilt.android.qualifiers.ApplicationContext
 import io.github.mayusi.emutran.BuildConfig
+import io.github.mayusi.emutran.data.source.GhAsset
+import io.github.mayusi.emutran.data.source.GhRelease
 import io.github.mayusi.emutran.data.source.HttpCache
+import io.github.mayusi.emutran.data.source.parseSha256SidecarBody
 import io.github.mayusi.emutran.domain.download.ApkDownloader
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -14,8 +17,6 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.SerialName
-import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -64,8 +65,8 @@ class SelfUpdateRepository @Inject constructor(
     private val httpCache: HttpCache,
     private val downloader: ApkDownloader,
     private val store: UpdateStateStore,
+    private val json: Json,
 ) {
-    private val json = Json { ignoreUnknownKeys = true }
 
     // ── Public API ──────────────────────────────────────────────────────────
 
@@ -168,18 +169,24 @@ class SelfUpdateRepository @Inject constructor(
         // Resolve expected SHA-256 from the sidecar file if a URL was provided.
         // The sidecar contains either just the 64-hex-char hash or a sha256sum
         // line of the form "<hash>  <filename>". We take the first 64-hex-char token.
+        //
+        // SECURITY (Fix 3): when a sidecar URL is present but unreachable, we ABORT.
+        // Proceeding without verification when a sidecar was expected would allow a
+        // targeted MITM that 404s the sidecar to bypass integrity checks. Only when
+        // sha256Url is null (release publishes no sidecar) do we skip verification.
         val expectedSha256: String? = if (sha256Url != null) {
-            fetchSidecarHash(sha256Url)
-                .also { hash ->
-                    if (hash == null) {
-                        // Sidecar fetch failed — we still proceed but integrity is unverified.
-                        // The downloader will skip verification when expectedSha256 is null.
-                        android.util.Log.w(
-                            TAG,
-                            "SHA-256 sidecar fetch failed for $sha256Url; proceeding without verification"
-                        )
-                    }
-                }
+            val hash = fetchSidecarHash(sha256Url)
+            if (hash == null) {
+                android.util.Log.e(
+                    TAG,
+                    "SHA-256 sidecar fetch failed for $sha256Url; aborting update for safety"
+                )
+                emit(ApkDownloader.Progress.Failed(
+                    "SHA-256 sidecar fetch failed; update aborted for safety"
+                ))
+                return@flow
+            }
+            hash
         } else {
             // No sidecar URL for this release — integrity is unverified.
             android.util.Log.d(TAG, "No SHA-256 sidecar for $apkUrl; skipping integrity check")
@@ -320,20 +327,18 @@ class SelfUpdateRepository @Inject constructor(
      * Returns the lowercase hash string, or null if the fetch or parse fails.
      * Failures are non-fatal: the download continues without verification.
      */
+    /**
+     * Fetches the sidecar .sha256 file at [url] and delegates body parsing
+     * to [parseSha256SidecarBody] (shared with AppSourceRouter so parsing
+     * logic is not duplicated). Returns null if the fetch or parse fails.
+     */
     private fun fetchSidecarHash(url: String): String? {
         return try {
             val request = Request.Builder().url(url).build()
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) return null
                 val text = response.body?.string() ?: return null
-                // Extract the first whitespace-delimited token that is exactly
-                // 64 lowercase hex characters (SHA-256 digest length).
-                text.trim()
-                    .splitToSequence(Regex("\\s+"))
-                    .firstOrNull { token ->
-                        token.length == 64 && token.all { c -> c in '0'..'9' || c in 'a'..'f' || c in 'A'..'F' }
-                    }
-                    ?.lowercase()
+                parseSha256SidecarBody(text)
             }
         } catch (t: Throwable) {
             android.util.Log.w(TAG, "Failed to fetch SHA-256 sidecar: ${t.message}")
@@ -358,24 +363,8 @@ class SelfUpdateRepository @Inject constructor(
         context.startActivity(intent)
     }
 
-    // ── Wire types ──────────────────────────────────────────────────────────
-
-    @Serializable
-    private data class GhRelease(
-        @SerialName("tag_name") val tagName: String? = null,
-        val name: String? = null,
-        val prerelease: Boolean = false,
-        val draft: Boolean = false,
-        val body: String? = null,
-        val assets: List<GhAsset> = emptyList(),
-    )
-
-    @Serializable
-    private data class GhAsset(
-        val name: String,
-        val size: Long = 0,
-        @SerialName("browser_download_url") val browserDownloadUrl: String,
-    )
+    // GhRelease and GhAsset are defined in GithubDtos.kt (shared with
+    // GitHubReleasesSource, GiteaSource, and DriverStager).
 
     companion object {
         /** EmuTran's own GitHub releases/latest endpoint. */
@@ -426,7 +415,7 @@ sealed interface SelfUpdateResult {
  * compares major.minor.patch numerically. Non-numeric or missing components
  * default to 0. Sufficient for EmuTran's "v0.x.y" release tags.
  */
-private data class SemVer(val major: Int, val minor: Int, val patch: Int) :
+internal data class SemVer(val major: Int, val minor: Int, val patch: Int) :
     Comparable<SemVer> {
     override fun compareTo(other: SemVer): Int =
         compareValuesBy(this, other, { it.major }, { it.minor }, { it.patch })

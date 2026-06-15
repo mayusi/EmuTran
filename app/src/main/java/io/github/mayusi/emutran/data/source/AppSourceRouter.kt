@@ -63,15 +63,9 @@ class AppSourceRouter @Inject constructor(
                 client.newCall(request).execute().use { response ->
                     if (!response.isSuccessful) return@withContext null
                     val text = response.body?.string() ?: return@withContext null
-                    // Extract the first whitespace-delimited token that is exactly
-                    // 64 hex characters (SHA-256 digest length).
-                    text.trim()
-                        .splitToSequence(Regex("\\s+"))
-                        .firstOrNull { token ->
-                            token.length == 64 &&
-                                token.all { c -> c in '0'..'9' || c in 'a'..'f' || c in 'A'..'F' }
-                        }
-                        ?.lowercase()
+                    // Delegate parsing to the shared utility in GithubDtos.kt so
+                    // the extraction logic is not duplicated with SelfUpdateRepository.
+                    parseSha256SidecarBody(text)
                 }
             } catch (t: Throwable) {
                 android.util.Log.w(TAG, "SHA-256 sidecar fetch failed for $sha256Url: ${t.message}")

@@ -10,8 +10,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
@@ -43,6 +43,7 @@ import io.github.mayusi.emutran.ui.theme.EmuTranTheme
 //   ---  ***       → horizontal rule (HorizontalDivider)
 //   blank line     → vertical gap between blocks
 //   > text         → blockquote (italic, secondary gray)
+//   ``` fence ```  → fenced code block (monospace, EmuTones.container bg)
 //   ![alt](url)    → alt text rendered plain (images skipped)
 //   plain text     → bodyMedium, primary white
 //
@@ -51,15 +52,28 @@ import io.github.mayusi.emutran.ui.theme.EmuTranTheme
 //   *text*   / _text_     → italic  (parsed after bold to avoid collision)
 //   `code`                → monospace, EmuTones.container background
 //   [label](url)          → bold + underlined white, clickable via UriHandler
+//                           ONLY http:// and https:// links are clickable;
+//                           all other schemes render as plain styled text.
+//
+// Security: links are only made clickable for http:// and https:// URLs.
+// javascript:, intent:, file:, market:, data: etc. are stripped to plain text.
 //
 // Links use the modern LinkAnnotation.Url API (no ClickableText required).
+// LinkAnnotation.Url routes taps through the system UriHandler implicitly —
+// no manual LocalUriHandler.current call is needed.
+//
+// Performance: parse(markdown) is wrapped in remember(markdown) and
+// parseInline results are memoized per text block to avoid re-parsing on
+// every recomposition (this composable lives in a bottom sheet that
+// recomposes frequently during download-progress updates).
+//
 // Malformed inline markdown never throws — the raw text is shown as-is.
 // Empty / blank input renders nothing.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── Block classification ─────────────────────────────────────────────────────
 
-private sealed interface MdBlock {
+internal sealed interface MdBlock {
     /** `#`, `##`, `###` heading. [level] 1–3. */
     data class Heading(val level: Int, val text: String) : MdBlock
     /** Bullet list item. [depth] 0 = top-level, 1+ = nested. */
@@ -72,6 +86,8 @@ private sealed interface MdBlock {
     object Rule : MdBlock
     /** Vertical whitespace between paragraphs. */
     object Gap : MdBlock
+    /** Fenced code block (``` ... ```). Content is the raw text between fences. */
+    data class FencedCode(val content: String) : MdBlock
     /** Fallthrough plain paragraph / sentence. */
     data class Paragraph(val text: String) : MdBlock
 }
@@ -83,22 +99,47 @@ private val BULLET_RE     = Regex("""^( {0,8})([-*+])\s+(.*)""")
 private val NUMBERED_RE   = Regex("""^(\d+\.)\s+(.*)""")
 private val BLOCKQUOTE_RE = Regex("""^>\s?(.*)""")
 private val RULE_RE       = Regex("""^([-*_])\1{2,}\s*$""")
+private val FENCE_RE      = Regex("""^```""")
 // Strip image syntax entirely; show alt text if non-empty.
 private val IMAGE_RE      = Regex("""!\[([^\]]*?)]\([^)]*?\)""")
 
 /**
  * Converts a raw Markdown string into a flat list of [MdBlock]s ready for
  * rendering.  Each line is classified exactly once; adjacent blank lines are
- * collapsed to a single [MdBlock.Gap].
+ * collapsed to a single [MdBlock.Gap].  Triple-backtick fenced code blocks
+ * are accumulated into a single [MdBlock.FencedCode].
  */
-private fun parse(markdown: String): List<MdBlock> {
+internal fun parse(markdown: String): List<MdBlock> {
     if (markdown.isBlank()) return emptyList()
 
     val blocks = mutableListOf<MdBlock>()
     var lastWasGap = false
+    var inFence = false
+    val fenceLines = mutableListOf<String>()
 
     for (rawLine in markdown.lines()) {
         val line = rawLine.trimEnd()
+
+        // ── Fenced code block ────────────────────────────────────────────────
+        if (FENCE_RE.containsMatchIn(line)) {
+            if (!inFence) {
+                // Opening fence — start accumulating.
+                inFence = true
+                fenceLines.clear()
+                lastWasGap = false
+            } else {
+                // Closing fence — emit accumulated content as FencedCode.
+                inFence = false
+                blocks += MdBlock.FencedCode(fenceLines.joinToString("\n"))
+                fenceLines.clear()
+                lastWasGap = false
+            }
+            continue
+        }
+        if (inFence) {
+            fenceLines += line
+            continue
+        }
 
         // Blank line → gap (deduplicated)
         if (line.isBlank()) {
@@ -157,8 +198,27 @@ private fun parse(markdown: String): List<MdBlock> {
         blocks += MdBlock.Paragraph(line)
     }
 
+    // If the file ends inside a fence (malformed), emit whatever we accumulated.
+    if (inFence && fenceLines.isNotEmpty()) {
+        blocks += MdBlock.FencedCode(fenceLines.joinToString("\n"))
+    }
+
     // Trim leading/trailing gaps
     return blocks.dropWhile { it is MdBlock.Gap }.dropLastWhile { it is MdBlock.Gap }
+}
+
+// ── URL scheme allowlist ──────────────────────────────────────────────────────
+
+/**
+ * Returns true if [url] has an allowed scheme for clickable links.
+ * Only http:// and https:// are permitted; all other schemes
+ * (javascript:, intent:, file:, market:, data:, etc.) are rejected
+ * to prevent untrusted release-body markdown from dispatching harmful URIs.
+ */
+internal fun isAllowedLinkScheme(url: String): Boolean {
+    val lower = url.trimStart()
+    return lower.startsWith("https://", ignoreCase = true) ||
+        lower.startsWith("http://", ignoreCase = true)
 }
 
 // ── Inline span parser ────────────────────────────────────────────────────────
@@ -168,10 +228,18 @@ private fun parse(markdown: String): List<MdBlock> {
  * applied.  Links use [LinkAnnotation.Url] so plain [Text] handles them —
  * no [androidx.compose.foundation.text.ClickableText] needed.
  *
+ * LinkAnnotation.Url routes taps through the system UriHandler implicitly;
+ * no LocalUriHandler.current call is required at the composable level.
+ *
+ * URL scheme allowlist (Fix 1): only http:// and https:// links become
+ * clickable spans.  Any other scheme (javascript:, intent:, file:, etc.)
+ * is rendered as plain styled text instead.
+ *
  * Order of matching:
  *   1. Backtick inline code  (suppresses further parsing inside)
  *   2. Bold `**` / `__`     (must precede italic to avoid eating outer `*`)
- *   3. Italic `*` / `_`
+ *   3. Italic `*` / `_`     (word-boundary guard for `_` to avoid mis-parsing
+ *                             identifiers like com.foo_bar_baz)
  *   4. Link `[label](url)`
  *   5. Plain character
  *
@@ -196,7 +264,8 @@ private fun parseInline(
             // ── Inline code ──────────────────────────────────────────────────
             if (src[cursor] == '`') {
                 val end = src.indexOf('`', cursor + 1)
-                if (end > cursor) {
+                // Require content between backticks: end > cursor + 1
+                if (end > cursor + 1) {
                     val code = src.substring(cursor + 1, end)
                     withStyle(
                         SpanStyle(
@@ -217,33 +286,53 @@ private fun parseInline(
                 else                          -> null
             }
             if (boldDelim != null) {
-                val end = src.indexOf(boldDelim, cursor + 2)
-                if (end > cursor) {
-                    val inner = src.substring(cursor + 2, end)
+                val delimLen = boldDelim.length
+                val end = src.indexOf(boldDelim, cursor + delimLen)
+                // Require non-empty content between delimiters.
+                if (end > cursor + delimLen) {
+                    val inner = src.substring(cursor + delimLen, end)
                     withStyle(SpanStyle(fontWeight = FontWeight.Bold, color = baseColor)) {
-                        append(inner)
+                        // Recursively parse inline spans inside bold.
+                        append(parseInline(inner, baseColor))
                     }
-                    cursor = end + 2
+                    cursor = end + delimLen
                     continue
                 }
             }
 
             // ── Italic: *...* or _..._ ────────────────────────────────────────
             // Only single-character delimiter (double already consumed above).
-            val italicDelim = when {
-                src[cursor] == '*' && !src.startsWith("**", cursor) -> "*"
-                src[cursor] == '_' && !src.startsWith("__", cursor) -> "_"
-                else -> null
-            }
-            if (italicDelim != null) {
+            //
+            // For `_`: apply a word-boundary guard so identifiers like
+            // com.foo_bar_baz are not mis-parsed as italic spans.
+            // Rule: the char immediately before `_` must not be alphanumeric,
+            // AND the char immediately after the closing `_` must not be alphanumeric.
+            // For `*`: no word-boundary guard (standard Markdown behaviour).
+            val isStarItalic = src[cursor] == '*' && !src.startsWith("**", cursor)
+            val isUnderItalic = src[cursor] == '_' && !src.startsWith("__", cursor)
+            if (isStarItalic || isUnderItalic) {
+                val italicDelim = if (isStarItalic) "*" else "_"
                 val end = src.indexOf(italicDelim, cursor + 1)
-                if (end > cursor) {
-                    val inner = src.substring(cursor + 1, end)
-                    withStyle(SpanStyle(fontStyle = FontStyle.Italic, color = baseColor)) {
-                        append(inner)
+                // Require non-empty content: end > cursor + 1
+                if (end > cursor + 1) {
+                    val valid = if (isUnderItalic) {
+                        // Word-boundary guard for underscore italics.
+                        val charBefore = if (cursor > 0) src[cursor - 1] else ' '
+                        val charAfter  = if (end + 1 < src.length) src[end + 1] else ' '
+                        !charBefore.isLetterOrDigit() && !charAfter.isLetterOrDigit()
+                    } else {
+                        true // `*` italics have no word-boundary restriction
                     }
-                    cursor = end + 1
-                    continue
+                    if (valid) {
+                        val inner = src.substring(cursor + 1, end)
+                        withStyle(SpanStyle(fontStyle = FontStyle.Italic, color = baseColor)) {
+                            // Recursively parse inline spans inside italic
+                            // (handles **bold** inside _italic_ etc.).
+                            append(parseInline(inner, baseColor))
+                        }
+                        cursor = end + 1
+                        continue
+                    }
                 }
             }
 
@@ -254,23 +343,53 @@ private fun parseInline(
                     labelEnd + 1 < src.length &&
                     src[labelEnd + 1] == '('
                 ) {
-                    val urlEnd = src.indexOf(')', labelEnd + 2)
+                    // Track paren nesting when scanning for closing ')' so URLs
+                    // containing ')' are handled correctly (e.g. Wikipedia links).
+                    val urlStart = labelEnd + 2
+                    var depth = 1
+                    var i = urlStart
+                    while (i < src.length && depth > 0) {
+                        when (src[i]) {
+                            '(' -> depth++
+                            ')' -> depth--
+                        }
+                        if (depth > 0) i++
+                    }
+                    val urlEnd = if (depth == 0) i else -1
+
                     if (urlEnd > labelEnd) {
                         val label = src.substring(cursor + 1, labelEnd)
-                        val url   = src.substring(labelEnd + 2, urlEnd)
-                        // LinkAnnotation.Url makes the span natively clickable in Text.
-                        withLink(
-                            LinkAnnotation.Url(
-                                url = url,
-                                styles = TextLinkStyles(
-                                    style = SpanStyle(
-                                        fontWeight     = FontWeight.Bold,
-                                        textDecoration = TextDecoration.Underline,
-                                        color          = EmuTones.onSurface,
+                        val url   = src.substring(urlStart, urlEnd)
+
+                        // FIX 1 (security): only make the link clickable for
+                        // http:// and https:// schemes. javascript:, intent:,
+                        // file:, market:, data:, etc. are rendered as styled
+                        // plain text to prevent untrusted release-body markdown
+                        // from dispatching harmful URIs via LocalUriHandler.
+                        if (isAllowedLinkScheme(url)) {
+                            withLink(
+                                LinkAnnotation.Url(
+                                    url = url,
+                                    styles = TextLinkStyles(
+                                        style = SpanStyle(
+                                            fontWeight     = FontWeight.Bold,
+                                            textDecoration = TextDecoration.Underline,
+                                            color          = EmuTones.onSurface,
+                                        ),
                                     ),
-                                ),
-                            )
-                        ) { append(label) }
+                                )
+                            ) { append(label) }
+                        } else {
+                            // Disallowed scheme — render label as plain styled text,
+                            // not as a clickable link, so the text is still readable
+                            // but the URI cannot be dispatched.
+                            withStyle(
+                                SpanStyle(
+                                    fontWeight = FontWeight.Bold,
+                                    color      = EmuTones.onSurface,
+                                )
+                            ) { append(label) }
+                        }
                         cursor = urlEnd + 1
                         continue
                     }
@@ -282,8 +401,10 @@ private fun parseInline(
             cursor++
         }
     }
-}.getOrElse {
+}.getOrElse { t ->
     // Malformed input — return raw text unstyled rather than crashing.
+    // Debug-level log to aid investigation of edge cases (stripped in release).
+    android.util.Log.d("MarkdownText", "parseInline failed on: $text", t)
     AnnotatedString(text)
 }
 
@@ -298,8 +419,16 @@ private fun parseInline(
  * constructs are shown as plain text; malformed input never throws.
  *
  * Links are clickable via [LinkAnnotation.Url] embedded in the [AnnotatedString]
- * — the system [LocalUriHandler] is wired through [TextLinkStyles] so standard
- * [Text] handles the tap without a separate click handler.
+ * — the system UriHandler is wired through [TextLinkStyles] implicitly, so
+ * standard [Text] handles the tap without any manual click handling.
+ *
+ * Only http:// and https:// URLs are made clickable (see security note in
+ * [parseInline]).
+ *
+ * Performance: block-list parsing is wrapped in [remember](markdown) and
+ * per-block inline parsing is wrapped in [remember](block.text) so neither
+ * re-runs on every recomposition (important: this composable lives inside a
+ * bottom sheet that recomposes on every download-progress update).
  *
  * @param markdown  Raw Markdown string (e.g. a GitHub release-note body).
  *                  Empty or blank input renders nothing.
@@ -310,12 +439,9 @@ fun MarkdownText(
     markdown: String,
     modifier: Modifier = Modifier,
 ) {
-    val blocks = parse(markdown)
+    // Memoize the full block-list parse so it only re-runs when markdown changes.
+    val blocks = remember(markdown) { parse(markdown) }
     if (blocks.isEmpty()) return
-
-    // UriHandler is available in the composition but wired through
-    // LinkAnnotation.Url — we don't call it manually.
-    LocalUriHandler.current
 
     Column(modifier = modifier) {
         for (block in blocks) {
@@ -329,8 +455,10 @@ fun MarkdownText(
                         else -> MaterialTheme.typography.titleSmall
                     }
                     val weight = if (block.level <= 2) FontWeight.Bold else FontWeight.SemiBold
+                    // Memoize inline parse per block text.
+                    val annotated = remember(block.text) { parseInline(block.text, EmuTones.onSurface) }
                     Text(
-                        text      = parseInline(block.text, EmuTones.onSurface),
+                        text      = annotated,
                         style     = style,
                         fontWeight = weight,
                         color     = EmuTones.onSurface,
@@ -340,9 +468,12 @@ fun MarkdownText(
                 // ── Bullet list ───────────────────────────────────────────────
                 is MdBlock.Bullet -> {
                     val startPad = if (block.depth > 0) Dimens.ItemGap * block.depth else 0.dp
-                    val full = buildAnnotatedString {
-                        append("•  ")
-                        append(parseInline(block.text, EmuTones.onSurface))
+                    val annotated = remember(block.text) { parseInline(block.text, EmuTones.onSurface) }
+                    val full = remember(annotated) {
+                        buildAnnotatedString {
+                            append("•  ")
+                            append(annotated)
+                        }
                     }
                     Text(
                         text     = full,
@@ -354,9 +485,12 @@ fun MarkdownText(
 
                 // ── Numbered list ─────────────────────────────────────────────
                 is MdBlock.Numbered -> {
-                    val full = buildAnnotatedString {
-                        append("${block.label}  ")
-                        append(parseInline(block.text, EmuTones.onSurface))
+                    val annotated = remember(block.text) { parseInline(block.text, EmuTones.onSurface) }
+                    val full = remember(block.label, annotated) {
+                        buildAnnotatedString {
+                            append("${block.label}  ")
+                            append(annotated)
+                        }
                     }
                     Text(
                         text  = full,
@@ -367,12 +501,36 @@ fun MarkdownText(
 
                 // ── Blockquote ────────────────────────────────────────────────
                 is MdBlock.Blockquote -> {
+                    val annotated = remember(block.text) {
+                        parseInline(block.text, EmuTones.onSurfaceVar)
+                    }
                     Text(
-                        text     = parseInline(block.text, EmuTones.onSurfaceVar),
+                        text     = annotated,
                         style    = MaterialTheme.typography.bodyMedium
                             .copy(fontStyle = FontStyle.Italic),
                         color    = EmuTones.onSurfaceVar,
                         modifier = Modifier.padding(start = Dimens.ItemGap),
+                    )
+                }
+
+                // ── Fenced code block ─────────────────────────────────────────
+                is MdBlock.FencedCode -> {
+                    val annotated = remember(block.content) {
+                        buildAnnotatedString {
+                            withStyle(
+                                SpanStyle(
+                                    fontFamily = FontFamily.Monospace,
+                                    background = EmuTones.container,
+                                    color      = EmuTones.onSurface,
+                                )
+                            ) { append(block.content) }
+                        }
+                    }
+                    Text(
+                        text     = annotated,
+                        style    = MaterialTheme.typography.bodySmall,
+                        color    = EmuTones.onSurface,
+                        modifier = Modifier.padding(vertical = 4.dp),
                     )
                 }
 
@@ -391,8 +549,11 @@ fun MarkdownText(
 
                 // ── Plain paragraph ───────────────────────────────────────────
                 is MdBlock.Paragraph -> {
+                    val annotated = remember(block.text) {
+                        parseInline(block.text, EmuTones.onSurface)
+                    }
                     Text(
-                        text  = parseInline(block.text, EmuTones.onSurface),
+                        text  = annotated,
                         style = MaterialTheme.typography.bodyMedium,
                         color = EmuTones.onSurface,
                     )
@@ -422,6 +583,7 @@ private fun PreviewMarkdownText() {
                     - Fixed crash on `arm32` devices when scanning app list
                       - Regression introduced in v0.2.1 — now resolved
                     - [View full diff](https://github.com/mayusi/EmuTran/compare/v0.2.0...v0.3.0)
+                    - Package com.foo_bar_baz should not be italic
 
                     ---
 
@@ -434,6 +596,15 @@ private fun PreviewMarkdownText() {
                     after this update.
 
                     Plain paragraph with **bold**, *italic*, and `inline code` all in one line.
+
+                    _italic **bold** italic_
+
+                    **bold _italic_ bold**
+
+                    ```
+                    val x = "hello"
+                    println(x)
+                    ```
                 """.trimIndent(),
                 modifier = Modifier
                     .fillMaxWidth()

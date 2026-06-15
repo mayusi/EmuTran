@@ -56,7 +56,8 @@ class QuickSetupViewModel @Inject constructor(
                 val dualScreen = setupOptions.isDualScreen.first()
                 val entries = withContext(Dispatchers.IO) {
                     if (dualScreen) parser.loadDualScreen() else parser.loadStandard()
-                }.filterNot { it.id == "904332840" } // Obtainium pack meta
+                // FIX #6: use the constant instead of the inline string.
+                }.filterNot { it.id == ObtainiumPackParser.OBTAINIUM_META_ENTRY_ID }
 
                 val recommended = entries
                     .filter { it.recommended }

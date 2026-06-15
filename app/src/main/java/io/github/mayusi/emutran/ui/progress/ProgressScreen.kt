@@ -29,6 +29,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -196,6 +200,7 @@ fun ProgressScreen(
                 Text(
                     text  = "Setting up GPU drivers…",
                     style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
                 )
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                 Text(
@@ -238,6 +243,7 @@ fun ProgressScreen(
                         text  = "Nothing was installed",
                         style = MaterialTheme.typography.titleLarge,
                         color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
                     )
                     val rateLimited = s.failed.any { (_, reason) -> "403" in reason }
                     Text(
@@ -257,17 +263,23 @@ fun ProgressScreen(
                         text  = "All done!",
                         style = MaterialTheme.typography.titleLarge,
                         color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
                     )
                 }
                 if (s.installed.isNotEmpty()) {
                     HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
                     Text("Installed (${s.installed.size}):", style = MaterialTheme.typography.titleSmall)
                     // Glyph prefix: check mark for installed items.
+                    // a11y: override contentDescription so TalkBack says "Installed: <name>"
+                    // instead of "check mark <name>".
                     s.installed.forEach { name ->
                         Text(
                             text  = "✓  $name",
                             style = MaterialTheme.typography.bodyMedium,
                             color = EmuTones.onSurface,
+                            modifier = Modifier.semantics {
+                                contentDescription = "Installed: $name"
+                            },
                         )
                     }
                 }
@@ -279,11 +291,16 @@ fun ProgressScreen(
                         color = MaterialTheme.colorScheme.tertiary,
                     )
                     // Glyph prefix: dot for skipped items.
+                    // a11y: override contentDescription so TalkBack says "Already had: <name>"
+                    // instead of "middle dot <name>".
                     s.skipped.forEach { name ->
                         Text(
                             text  = "·  $name",
                             style = MaterialTheme.typography.bodyMedium,
                             color = EmuTones.onSurfaceVar,
+                            modifier = Modifier.semantics {
+                                contentDescription = "Already had: $name"
+                            },
                         )
                     }
                 }
@@ -295,11 +312,16 @@ fun ProgressScreen(
                         color = MaterialTheme.colorScheme.error,
                     )
                     // Glyph prefix: × for failed items.
+                    // a11y: override contentDescription so TalkBack says "Failed: <name> — <reason>"
+                    // instead of "multiplication sign <name> — <reason>".
                     s.failed.forEach { (name, reason) ->
                         Text(
                             text  = "✗  $name — $reason",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.semantics {
+                                contentDescription = "Failed: $name — $reason"
+                            },
                         )
                     }
                 }
@@ -391,11 +413,13 @@ fun ProgressScreen(
                     text  = "Setup failed",
                     style = MaterialTheme.typography.titleMedium,
                     color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
                 )
                 Text(
                     text  = s.message,
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
                 )
 
                 // FIX 3: Failed state must not be a dead-end — give the user two exits.
@@ -429,6 +453,13 @@ fun ProgressScreen(
                     )
                 }
             }
+
+            // FIX 1: Cancelled is a terminal state emitted by cancelAndReset().
+            // The cancel dialog calls onGoToDashboard() immediately after
+            // cancelAndReset(), so by the time this branch would render the
+            // composable is already leaving the back-stack. Render nothing to
+            // avoid a flash of unexpected UI if composition runs one extra frame.
+            ProgressViewModel.State.Cancelled -> Unit
         }
     }
 }
@@ -454,7 +485,11 @@ private fun DownloadCard(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text(text = label, style = MaterialTheme.typography.bodyLarge)
+            Text(
+                text = label,
+                style = MaterialTheme.typography.bodyLarge,
+                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+            )
             LinearProgressIndicator(
                 progress = { overallProgress },
                 modifier = Modifier.fillMaxWidth(),
@@ -479,6 +514,7 @@ private fun PhaseLine(label: String, done: Int, total: Int, detail: String) {
     Text(
         text  = "$label — $done / $total",
         style = MaterialTheme.typography.bodyLarge,
+        modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
     )
     LinearProgressIndicator(
         progress = { if (total > 0) done.toFloat() / total else 0f },
@@ -488,6 +524,7 @@ private fun PhaseLine(label: String, done: Int, total: Int, detail: String) {
         text  = detail,
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
     )
 }
 

@@ -4,7 +4,6 @@ import io.github.mayusi.emutran.data.manifest.AppEntry
 import io.github.mayusi.emutran.data.manifest.SourceKind
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -30,9 +29,8 @@ import javax.inject.Singleton
 class GitHubReleasesSource @Inject constructor(
     private val cache: HttpCache,
     private val client: OkHttpClient,
+    private val json: Json,
 ) : AppSource {
-
-    private val json = Json { ignoreUnknownKeys = true }
 
     override suspend fun resolve(entry: AppEntry): ResolveResult = withContext(Dispatchers.IO) {
         if (entry.source != SourceKind.GITHUB) return@withContext ResolveResult.Unsupported
@@ -103,7 +101,8 @@ class GitHubReleasesSource @Inject constructor(
             val assetNames = release.assets.map { it.name }
             val picked = ApkAssetFilter.pick(assetNames, entry) ?: continue
             val (pickedName, kind) = picked
-            val asset = release.assets.first { it.name == pickedName }
+            val asset = release.assets.firstOrNull { it.name == pickedName }
+                ?: continue
 
             // FIX 1 (SHA-256 sidecar): look for a sibling asset named "<apkName>.sha256"
             // in the same release. If present, store its URL so AppSourceRouter can
@@ -135,24 +134,16 @@ class GitHubReleasesSource @Inject constructor(
 
     /** Pulls "owner/repo" from a github URL, tolerating trailing slashes / .git. */
     private fun parseOwnerRepo(url: String): String? {
-        val regex = Regex("""github\.com/([^/]+)/([^/?#.]+)""", RegexOption.IGNORE_CASE)
-        val match = regex.find(url) ?: return null
+        val match = OWNER_REPO_REGEX.find(url) ?: return null
         return "${match.groupValues[1]}/${match.groupValues[2]}"
     }
 
-    @Serializable
-    private data class GhRelease(
-        @kotlinx.serialization.SerialName("tag_name") val tagName: String? = null,
-        val name: String? = null,
-        val prerelease: Boolean = false,
-        val draft: Boolean = false,
-        val assets: List<GhAsset> = emptyList(),
-    )
+    // GhRelease and GhAsset are defined in GithubDtos.kt (shared with
+    // GiteaSource, DriverStager, and SelfUpdateRepository).
 
-    @Serializable
-    private data class GhAsset(
-        val name: String,
-        val size: Long = 0,
-        @kotlinx.serialization.SerialName("browser_download_url") val browserDownloadUrl: String,
-    )
+    companion object {
+        /** "owner/repo" extractor — hoisted so it compiles once, not per resolve. */
+        private val OWNER_REPO_REGEX =
+            Regex("""github\.com/([^/]+)/([^/?#.]+)""", RegexOption.IGNORE_CASE)
+    }
 }

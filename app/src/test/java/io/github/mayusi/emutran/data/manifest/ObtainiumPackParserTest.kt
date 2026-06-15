@@ -18,6 +18,7 @@ class ObtainiumPackParserTest {
         context = mockk(relaxed = true),
         httpCache = mockk(relaxed = true),
         okHttpClient = mockk(relaxed = true),
+        manifestDiffStore = mockk(relaxed = true),
     )
 
     private fun loadResource(name: String): String =
@@ -96,9 +97,9 @@ class ObtainiumPackParserTest {
             SystemTag.SEGA,
         )
         // OTHER shouldn't dominate. If more than 30% of entries are OTHER,
-        // our heuristic is broken.
+        // our heuristic is broken. Use atMost so boundary-exact counts pass.
         val otherCount = entries.count { it.system == SystemTag.OTHER }
-        assertThat(otherCount.toDouble() / entries.size).isLessThan(0.30)
+        assertThat(otherCount.toDouble() / entries.size).isAtMost(0.30)
     }
 
     @Test

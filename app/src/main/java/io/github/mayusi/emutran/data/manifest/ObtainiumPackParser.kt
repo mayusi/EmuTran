@@ -59,6 +59,7 @@ class ObtainiumPackParser @Inject constructor(
     @ApplicationContext private val context: Context,
     private val httpCache: HttpCache,
     private val okHttpClient: OkHttpClient,
+    private val manifestDiffStore: ManifestDiffStore,
 ) {
     private val json = Json {
         ignoreUnknownKeys = true   // future Obtainium settings shouldn't break us
@@ -77,14 +78,36 @@ class ObtainiumPackParser @Inject constructor(
 
     suspend fun loadStandard(): List<AppEntry> =
         standardMutex.withLock {
-            standardCache ?: load(STANDARD_FILENAME, STANDARD_URL).also { standardCache = it }
+            standardCache ?: load(
+                STANDARD_FILENAME, STANDARD_URL, ManifestDiffStore.VARIANT_STANDARD,
+            ).also { standardCache = it }
         }
 
     suspend fun loadDualScreen(): List<AppEntry> =
         dualScreenMutex.withLock {
             dualScreenCache
-                ?: load(DUAL_SCREEN_FILENAME, DUAL_SCREEN_URL).also { dualScreenCache = it }
+                ?: load(
+                    DUAL_SCREEN_FILENAME, DUAL_SCREEN_URL, ManifestDiffStore.VARIANT_DUAL_SCREEN,
+                ).also { dualScreenCache = it }
         }
+
+    /**
+     * Parses ONLY the bundled APK asset — no network fetch, no disk cache,
+     * no coroutine mutex. Runs on IO but is cheap (asset read + JSON parse).
+     *
+     * Intended for startup routing (SetupStateDetector.isSetUp) where we need
+     * a fast, offline-capable answer to "is any manifest app installed?" before
+     * deciding whether to show the Dashboard or the Setup splash. The live
+     * network refresh still happens lazily when the user reaches PickApps /
+     * Dashboard (via loadStandard / loadDualScreen — unchanged).
+     *
+     * This method deliberately does NOT populate standardCache so that the
+     * first loadStandard() call still triggers a network refresh in the
+     * background, picking up any updates since the APK was built.
+     */
+    suspend fun loadBundledOnly(): List<AppEntry> = withContext(Dispatchers.IO) {
+        parseAsset(STANDARD_FILENAME)
+    }
 
     /**
      * Load one manifest variant via the full fallback chain:
@@ -93,10 +116,11 @@ class ObtainiumPackParser @Inject constructor(
      * Returns the parsed list. Never throws — worst case returns the
      * bundled asset entries.
      */
-    private suspend fun load(filename: String, remoteUrl: String): List<AppEntry> =
+    private suspend fun load(filename: String, remoteUrl: String, variant: String): List<AppEntry> =
         withContext(Dispatchers.IO) {
             // --- Network attempt (with ETag revalidation) ---
-            val networkResult = runCatching { fetchFromNetwork(filename, remoteUrl) }.getOrNull()
+            val networkResult =
+                runCatching { fetchFromNetwork(filename, remoteUrl, variant) }.getOrNull()
             if (networkResult != null) return@withContext networkResult
 
             // --- Disk copy from a prior successful fetch ---
@@ -114,7 +138,11 @@ class ObtainiumPackParser @Inject constructor(
      * cached body. On 200 persists the new body to disk and updates the
      * ETag. Returns null on any network/HTTP error.
      */
-    private suspend fun fetchFromNetwork(filename: String, remoteUrl: String): List<AppEntry>? {
+    private suspend fun fetchFromNetwork(
+        filename: String,
+        remoteUrl: String,
+        variant: String,
+    ): List<AppEntry>? {
         val cached = httpCache.get(remoteUrl, HttpCache.MANIFEST_TTL_MS)
         val request = Request.Builder()
             .url(remoteUrl)
@@ -140,10 +168,39 @@ class ObtainiumPackParser @Inject constructor(
                     // Update ETag cache.
                     val etag = response.header("ETag") ?: ""
                     httpCache.put(remoteUrl, HttpCache.Entry(etag, body, System.currentTimeMillis()))
-                    parseJson(body)
+                    val entries = parseJson(body)
+                    // Capture a "what's new" diff vs the previously-seen catalog so
+                    // the dashboard can show a "Pack updated: +X, -Y" banner. Only on
+                    // a fresh 200 (a genuine upstream change); 304 / disk / asset paths
+                    // never call this. Exclude the Obtainium meta-entry — it has no
+                    // real package and shouldn't surface in the banner.
+                    captureManifestDiff(variant, entries)
+                    entries
                 }
                 else -> null  // 4xx/5xx — fall through to disk/bundled
             }
+        }
+    }
+
+    /**
+     * Feed the freshly-parsed [entries] to [ManifestDiffStore] so it can
+     * capture an added/removed diff vs the previously-seen catalog FOR THE
+     * SAME [variant] (standard vs dual-screen). Compares by id (excluding
+     * [OBTAINIUM_META_ENTRY_ID]); removed ids that are no longer in the catalog
+     * fall back to the id string for their name.
+     *
+     * Passing [variant] keeps the baseline per-variant so refreshing both
+     * manifests in one session can't fabricate a bogus cross-variant banner.
+     *
+     * Wrapped in runCatching so a diff-store hiccup can never break the
+     * manifest fetch (the fetch result is already computed by this point).
+     */
+    private suspend fun captureManifestDiff(variant: String, entries: List<AppEntry>) {
+        runCatching {
+            val visible = entries.filterNot { it.id == OBTAINIUM_META_ENTRY_ID }
+            val currentIds = visible.map { it.id }.toSet()
+            val nameById = visible.associate { it.id to it.name }
+            manifestDiffStore.computeAndStoreDiff(variant, currentIds) { id -> nameById[id] ?: id }
         }
     }
 
@@ -319,6 +376,17 @@ class ObtainiumPackParser @Inject constructor(
         const val DUAL_SCREEN_FILENAME = "obtainium-emulation-pack-dual-screen-latest.json"
 
         /**
+         * Obtainium numeric tracker id for the Obtainium pack meta-entry itself.
+         * This entry has no real Android package id and must be excluded from
+         * any picker / dashboard app lists.
+         *
+         * Currently filtered inline in PickAppsViewModel, QuickSetupViewModel, and
+         * DashboardViewModel as `filterNot { it.id == OBTAINIUM_META_ENTRY_ID }`.
+         * Those call-sites should reference this constant instead of the raw string.
+         */
+        const val OBTAINIUM_META_ENTRY_ID = "904332840"
+
+        /**
          * Raw GitHub URLs for RJNY/Obtainium-Emulation-Pack (main branch).
          * Filenames match the bundled asset names so the fallback chain
          * always uses the same filename key.
@@ -328,13 +396,6 @@ class ObtainiumPackParser @Inject constructor(
         const val STANDARD_URL = "$GITHUB_RAW_BASE/$STANDARD_FILENAME"
         const val DUAL_SCREEN_URL = "$GITHUB_RAW_BASE/$DUAL_SCREEN_FILENAME"
 
-        /**
-         * id → friendly display name. Used to disambiguate entries whose
-         * raw manifest names collide or read confusingly. The three Winlator
-         * forks have different package ids (so they can coexist) but two of
-         * them otherwise render as the same string — these overrides give
-         * each card a distinct label. Add more entries here as needed.
-         */
         /**
          * Raw manifest id → real Android package name. Some entries use an
          * Obtainium *numeric tracker id* because their source is an
@@ -350,6 +411,13 @@ class ObtainiumPackParser @Inject constructor(
             "487343354" to "com.retroarch.aarch64",
         )
 
+        /**
+         * id → friendly display name. Used to disambiguate entries whose
+         * raw manifest names collide or read confusingly. The three Winlator
+         * forks have different package ids (so they can coexist) but two of
+         * them otherwise render as the same string — these overrides give
+         * each card a distinct label. Add more entries here as needed.
+         */
         private val DISPLAY_NAME_OVERRIDES: Map<String, String> = mapOf(
             "com.winlator" to "Winlator",
             "com.winlator.cmod" to "Winlator (Community Mod)",

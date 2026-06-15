@@ -11,6 +11,8 @@ import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
+import io.github.mayusi.emutran.data.manifest.ObtainiumPackParser
+import io.github.mayusi.emutran.data.storage.SetupOptionsStore
 import io.github.mayusi.emutran.data.update.UpdateRepository
 import io.github.mayusi.emutran.data.update.UpdateStateStore
 import kotlinx.coroutines.flow.first
@@ -20,36 +22,13 @@ import java.util.concurrent.TimeUnit
  * Periodic background worker that checks for emulator updates while the
  * user isn't actively using the app.
  *
- * Annotated with [@HiltWorker] and injected via [@AssistedInject] — the
- * standard Hilt-WorkManager pattern. The HiltWorkerFactory must be
- * configured in the Application class (done in [EmuTranApplication]).
+ * == FIX 2: display names in notifications ==
  *
- * == Schedule ==
- *
- * Runs every 6 hours with a 15-minute flex window. Constraints:
- *   - NetworkType.CONNECTED — pointless without a network.
- *   - Battery not low — respect the device's battery-saving mode.
- *
- * [ExistingPeriodicWorkPolicy.KEEP] prevents duplicate scheduling if
- * [schedule] is called repeatedly (e.g. on every app launch).
- *
- * == What it does ==
- *
- * Calls [UpdateRepository.checkNow] with force=false so entries checked
- * less than 6h ago are skipped at the repository level too. The worker
- * itself is scheduled every 6h, but the repository guard is a second
- * line of defence against OS-level constraint drift.
- *
- * After the check completes, the worker compares the current set of
- * pending updates (by signature) against what was last notified. If the
- * signature differs — meaning a genuinely new update has appeared — it
- * posts a system notification via [UpdateNotifier] and saves the new
- * signature via [UpdateStateStore]. This prevents re-notifying for the
- * same versions on every 6-hour tick.
- *
- * Updates are NOT downloaded or installed by this worker — that would
- * be intrusive. It only refreshes the stored update state so the UI
- * can show a badge / chip when the user opens the app.
+ * Previously the notification body used raw entryIds (package names).
+ * Now the worker loads the manifest, builds an id→name map, and passes
+ * friendly display names to [UpdateNotifier.notifyUpdatesAvailable].
+ * Manifest loading is cheap — the parser has an in-memory cache and the
+ * result is reused from the app's normal manifest load if already warm.
  */
 @HiltWorker
 class UpdateCheckWorker @AssistedInject constructor(
@@ -58,6 +37,9 @@ class UpdateCheckWorker @AssistedInject constructor(
     private val updateRepository: UpdateRepository,
     private val updateStateStore: UpdateStateStore,
     private val updateNotifier: UpdateNotifier,
+    // FIX 2: inject manifest parser + options to resolve display names.
+    private val packParser: ObtainiumPackParser,
+    private val setupOptions: SetupOptionsStore,
 ) : CoroutineWorker(context, params) {
 
     override suspend fun doWork(): Result {
@@ -71,7 +53,6 @@ class UpdateCheckWorker @AssistedInject constructor(
 
             if (pending.isNotEmpty()) {
                 // Signature = sorted "entryId:availableVersion" joined by "|".
-                // Sorting ensures the signature is order-independent.
                 val newSig = pending
                     .map { "${it.entryId}:${it.availableVersion.orEmpty()}" }
                     .sorted()
@@ -80,26 +61,23 @@ class UpdateCheckWorker @AssistedInject constructor(
                 val lastSig = updateStateStore.getLastNotifiedSignature()
 
                 if (newSig != lastSig) {
-                    // Update set has changed since we last notified — post a
-                    // fresh notification and record the new signature.
-                    val sampleNames = pending
+                    // FIX 2: build id→name map from the manifest so we show
+                    // "Dolphin, PPSSPP" instead of "org.dolphinemu.dolphinemu, org.ppsspp.ppsspp".
+                    val isDual = setupOptions.isDualScreen.first()
+                    val entries = if (isDual) packParser.loadDualScreen() else packParser.loadStandard()
+                    val nameMap: Map<String, String> = entries.associate { it.id to it.name }
+
+                    val displayNames = pending
                         .sortedBy { it.entryId }
-                        .map { it.entryId }          // fallback: entryId as display name
-                    updateNotifier.notifyUpdatesAvailable(pending.size, sampleNames)
+                        .map { nameMap[it.entryId] ?: it.entryId }  // fallback: raw id
+
+                    updateNotifier.notifyUpdatesAvailable(pending.size, displayNames)
                     updateStateStore.setLastNotifiedSignature(newSig)
                 }
-                // If newSig == lastSig, the user was already notified about
-                // this exact set — skip to avoid 6-hour spam.
             }
-            // If pending is empty we leave the signature alone. The notification
-            // was presumably dismissed by the user or cancelled when they
-            // installed an update. NotificationManagerCompat auto-cancel
-            // (setAutoCancel=true on the notification) handles dismissal on tap.
 
             Result.success()
         } catch (t: Throwable) {
-            // Retry on transient failures (network unavailable, rate limit,
-            // etc.). WorkManager will back off and retry up to its limit.
             Result.retry()
         }
     }
@@ -111,9 +89,6 @@ class UpdateCheckWorker @AssistedInject constructor(
         /**
          * Enqueue the periodic update-check worker, or do nothing if it is
          * already scheduled ([ExistingPeriodicWorkPolicy.KEEP]).
-         *
-         * Call this once from [EmuTranApplication.onCreate] or a startup
-         * initializer. Safe to call on every launch.
          */
         fun schedule(context: Context) {
             val constraints = Constraints.Builder()
@@ -126,7 +101,7 @@ class UpdateCheckWorker @AssistedInject constructor(
                 repeatIntervalTimeUnit = TimeUnit.HOURS,
             )
                 .setConstraints(constraints)
-                .setInitialDelay(15L, TimeUnit.MINUTES) // don't fire immediately at first launch
+                .setInitialDelay(15L, TimeUnit.MINUTES)
                 .build()
 
             WorkManager.getInstance(context).enqueueUniquePeriodicWork(

@@ -136,6 +136,7 @@ private fun HealthTopBar(onBack: () -> Unit) {
     ) {
         IconButton(
             onClick = onBack,
+            interactionSource = backInteraction,
             modifier = Modifier.dpadFocusBorder(backInteraction, cornerRadius = 50.dp),
         ) {
             Icon(

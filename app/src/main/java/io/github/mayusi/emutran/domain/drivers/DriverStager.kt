@@ -2,9 +2,11 @@ package io.github.mayusi.emutran.domain.drivers
 
 import io.github.mayusi.emutran.data.device.GpuFamily
 import io.github.mayusi.emutran.data.device.GpuInfo
+import io.github.mayusi.emutran.data.source.GhAsset
+import io.github.mayusi.emutran.data.source.GhRelease
+import io.github.mayusi.emutran.data.source.HttpsDowngradeInterceptor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -39,19 +41,30 @@ import javax.inject.Singleton
  * folder explains the difference and records what was selected.
  *
  * If the device isn't Adreno, we skip entirely (Turnip is Adreno-only).
+ *
+ * HTTPS-downgrade protection: driver zips are downloaded via a private
+ * client that rejects any redirect from https:// to http://, matching
+ * the protection applied to APK downloads in ApkDownloader.
  */
 @Singleton
 class DriverStager @Inject constructor(
-    // Shared singleton OkHttpClient provided by AppModule. Using the
-    // shared client avoids creating a third connection pool (AppModule
-    // already provides one for data-source calls; ApkDownloader owns a
-    // second). The shared client has followRedirects/followSslRedirects
-    // and sensible timeouts (connect 20 s, read 60 s) that suit both
-    // the small GitHub Releases API call and the larger driver-zip downloads.
+    // Shared singleton OkHttpClient provided by AppModule. A private client
+    // is built from it (see [downloadClient]) that adds the HTTPS-downgrade
+    // interceptor without mutating the shared pool.
     private val client: OkHttpClient,
+    // Shared kotlinx.serialization Json (ignoreUnknownKeys = true) from AppModule.
+    private val json: Json,
 ) {
 
-    private val json = Json { ignoreUnknownKeys = true }
+    /**
+     * Private download client: inherits the shared client's pool, timeouts,
+     * and GitHub auth interceptor, but adds an interceptor that blocks any
+     * HTTPS→HTTP redirect. Defense-in-depth: driver zips transit the same
+     * GitHub CDN as APKs, so downgrade protection is equally warranted.
+     */
+    private val downloadClient: OkHttpClient = client.newBuilder()
+        .addNetworkInterceptor(HttpsDowngradeInterceptor())
+        .build()
 
     /**
      * Discover the right driver set for [gpu]. Fetches recent releases,
@@ -131,16 +144,16 @@ class DriverStager @Inject constructor(
         val qualcomm: Owned? = when (series) {
             GpuSeries.ELITE -> owned.firstOrNull { "8elite2" in it.asset.token() }
             GpuSeries.SERIES_8XX -> owned.firstOrNull {
-                Regex("""qualcomm_849""").containsMatchIn(it.asset.token())
+                QUALCOMM_849_REGEX.containsMatchIn(it.asset.token())
             }
             GpuSeries.SERIES_7XX -> {
                 // Prefer the higher/newer Qualcomm number (840 over 837).
                 val sevenXx = owned.filter {
-                    Regex("""qualcomm_8[0-9]{2}""").containsMatchIn(it.asset.token()) &&
+                    QUALCOMM_8XX_REGEX.containsMatchIn(it.asset.token()) &&
                         ("qualcomm_840" in it.asset.token() || "qualcomm_837" in it.asset.token())
                 }
                 sevenXx.maxByOrNull { o ->
-                    Regex("""qualcomm_(\d{3})""").find(o.asset.token())
+                    QUALCOMM_NUMBER_REGEX.find(o.asset.token())
                         ?.groupValues?.get(1)?.toIntOrNull() ?: 0
                 }
             }
@@ -185,6 +198,8 @@ class DriverStager @Inject constructor(
      * Download [picked] assets into [turnipDir] (typically
      * Emulation/tools/turnip/). Existing files with matching names are
      * overwritten — idempotent.
+     *
+     * Uses [downloadClient] (HTTPS-downgrade protected) for all fetches.
      */
     suspend fun stage(picked: List<Asset>, turnipDir: File): StageResult = withContext(Dispatchers.IO) {
         if (!turnipDir.exists() && !turnipDir.mkdirs()) {
@@ -204,7 +219,8 @@ class DriverStager @Inject constructor(
         for (asset in picked) {
             val out = File(turnipDir, asset.name)
             try {
-                client.newCall(Request.Builder().url(asset.url).build()).execute().use { resp ->
+                // Use downloadClient (HTTPS-downgrade interceptor) for all fetches.
+                downloadClient.newCall(Request.Builder().url(asset.url).build()).execute().use { resp ->
                     if (!resp.isSuccessful) {
                         failed += asset.name to "HTTP ${resp.code}"
                         return@use
@@ -262,20 +278,6 @@ class DriverStager @Inject constructor(
         appendLine("variants if you want more performance in specific emulators.")
     }
 
-    @Serializable
-    internal data class GhRelease(
-        @kotlinx.serialization.SerialName("tag_name") val tagName: String? = null,
-        val name: String? = null,
-        val assets: List<GhAsset> = emptyList(),
-    )
-
-    @Serializable
-    internal data class GhAsset(
-        val name: String,
-        val size: Long = 0,
-        @kotlinx.serialization.SerialName("browser_download_url") val browserDownloadUrl: String = "",
-    )
-
     data class Asset(val name: String, val url: String, val sizeBytes: Long)
 
     sealed interface DiscoverResult {
@@ -294,5 +296,19 @@ class DriverStager @Inject constructor(
             val failed: List<Pair<String, String>>,
         ) : StageResult
         data class Failed(val reason: String) : StageResult
+    }
+
+    companion object {
+        // Hoisted so they compile once instead of on every selectAssetsForGpu
+        // call. Matched against the lowercased, '-'→'_' normalised asset name.
+
+        /** Adreno 8xx Qualcomm build marker. */
+        private val QUALCOMM_849_REGEX = Regex("""qualcomm_849""")
+
+        /** Any qualcomm_8xx build (gate for the 7xx 840/837 filter). */
+        private val QUALCOMM_8XX_REGEX = Regex("""qualcomm_8[0-9]{2}""")
+
+        /** Captures the 3-digit Qualcomm number so 840 beats 837 in ties. */
+        private val QUALCOMM_NUMBER_REGEX = Regex("""qualcomm_(\d{3})""")
     }
 }

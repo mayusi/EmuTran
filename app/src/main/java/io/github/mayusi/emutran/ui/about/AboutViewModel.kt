@@ -7,6 +7,7 @@ import io.github.mayusi.emutran.data.auth.GithubTokenStore
 import io.github.mayusi.emutran.data.update.SelfUpdateRepository
 import io.github.mayusi.emutran.data.update.SelfUpdateResult
 import io.github.mayusi.emutran.domain.download.ApkDownloader
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -30,11 +31,13 @@ import javax.inject.Inject
  *   [SelfUpdateUiState.UpToDate]    — latest version; show snackbar.
  *   [SelfUpdateUiState.Failed]      — error; message to show in snackbar.
  *
- * The sheet is dismissed via [dismissSheet], which cancels any in-flight
- * download and resets state to Idle.
- *
- * GitHub token: exposed via [githubToken] (null when unset). [setGithubToken]
- * persists the value; [clearGithubToken] removes it.
+ * FIX 4 changes:
+ *   - [SelfUpdateUiState.Downloading] now carries [version] so the shared
+ *     sheet title doesn't lose the version string during download.
+ *   - [downloadAndInstall] throttles Chunk→Downloading state emissions to
+ *     ~200ms to avoid recomposing the sheet on every 64 KB chunk.
+ *   - [CancellationException] from a user-dismissed download is caught and
+ *     state is reset silently (no "Update failed" snackbar).
  */
 @HiltViewModel
 class AboutViewModel @Inject constructor(
@@ -66,9 +69,6 @@ class AboutViewModel @Inject constructor(
     private val _uiState = MutableStateFlow<SelfUpdateUiState>(SelfUpdateUiState.Idle)
     val uiState: StateFlow<SelfUpdateUiState> = _uiState.asStateFlow()
 
-    // FIX 1: Track the active download job so dismissSheet() can cancel it.
-    // Without this, a dismissed sheet would let the download finish and then
-    // launch the system installer behind the user's back.
     private var downloadJob: Job? = null
 
     /**
@@ -103,39 +103,39 @@ class AboutViewModel @Inject constructor(
      * Start downloading + installing the APK at [apkUrl].
      * Transitions: Available → Downloading(progress) → Launching.
      *
-     * The SHA-256 sidecar URL is automatically taken from the current
-     * [SelfUpdateUiState.Available] state (where it was stored by
-     * [checkForSelfUpdate]). The caller (AboutScreen) only needs to pass
-     * [apkUrl]; no change to the existing screen call-site is required.
+     * FIX 4 (throttle): Chunk events are throttled to ~200ms so every 64 KB
+     * chunk doesn't cause a full recompose of the sheet.
      *
-     * When a sha256Url is available, the downloader fetches the sidecar and
-     * verifies the file's integrity before launching the installer. On checksum
-     * mismatch the downloader emits [ApkDownloader.Progress.Failed] and the
-     * installer is never reached.
+     * FIX 4 (version): the version string is read from [SelfUpdateUiState.Available]
+     * before the state transitions to Downloading, so the Downloading state can
+     * carry it and the title "What's new in vX" stays correct.
      *
-     * FIX 1: The Job is stored in [downloadJob] so that [dismissSheet] can
-     * cancel it. Cancelling the coroutine before [ApkDownloader.Progress.Done]
-     * is collected means [launchInstaller] is never reached in the repository.
+     * FIX 4 (CancellationException): user-cancelled downloads are reset to Idle
+     * silently; the exception is re-thrown for structured concurrency.
      */
     fun downloadAndInstall(apkUrl: String) {
-        // Retrieve the sha256Url from the current Available state, if present.
-        // This is the correct place to read it: the state is Available at the
-        // moment the user taps "Update now" and it won't change until the
-        // coroutine below transitions it to Downloading.
-        val sha256Url = (_uiState.value as? SelfUpdateUiState.Available)?.sha256Url
+        val currentAvailable = _uiState.value as? SelfUpdateUiState.Available
+        val sha256Url = currentAvailable?.sha256Url
+        // FIX 4: capture version before transitioning to Downloading.
+        val version = currentAvailable?.version ?: ""
 
-        // FIX 1: Store the Job so dismissSheet() can cancel an in-flight download.
         downloadJob = viewModelScope.launch {
             try {
+                var lastEmitMs = 0L
                 selfUpdateRepository.downloadAndInstall(apkUrl, sha256Url).collect { progress ->
                     when (progress) {
                         is ApkDownloader.Progress.Started ->
-                            _uiState.value = SelfUpdateUiState.Downloading(0)
+                            _uiState.value = SelfUpdateUiState.Downloading(0, version)
                         is ApkDownloader.Progress.Chunk -> {
-                            val pct = if (progress.totalBytes > 0L) {
-                                (progress.downloaded * 100 / progress.totalBytes).toInt()
-                            } else 0
-                            _uiState.value = SelfUpdateUiState.Downloading(pct)
+                            // FIX 4 throttle: emit at most once per 200ms.
+                            val now = System.currentTimeMillis()
+                            if (now - lastEmitMs >= DOWNLOAD_EMIT_THROTTLE_MS) {
+                                lastEmitMs = now
+                                val pct = if (progress.totalBytes > 0L) {
+                                    (progress.downloaded * 100 / progress.totalBytes).toInt()
+                                } else 0
+                                _uiState.value = SelfUpdateUiState.Downloading(pct, version)
+                            }
                         }
                         is ApkDownloader.Progress.Done ->
                             _uiState.value = SelfUpdateUiState.Launching
@@ -143,6 +143,10 @@ class AboutViewModel @Inject constructor(
                             _uiState.value = SelfUpdateUiState.Failed(progress.message)
                     }
                 }
+            } catch (e: CancellationException) {
+                // FIX 4: user dismissed the sheet — reset to Idle silently.
+                _uiState.value = SelfUpdateUiState.Idle
+                throw e  // rethrow for structured concurrency
             } catch (e: Throwable) {
                 _uiState.value = SelfUpdateUiState.Failed(
                     e.message ?: e.javaClass.simpleName
@@ -153,18 +157,13 @@ class AboutViewModel @Inject constructor(
 
     /**
      * Dismiss the update bottom sheet and return to [SelfUpdateUiState.Idle].
-     * Also resets Launching/UpToDate/Failed so the snackbar can be re-triggered.
-     *
-     * FIX 1: Cancels [downloadJob] if a download is in flight, preventing the
-     * system installer from launching after the user dismisses the sheet.
+     * Cancels [downloadJob] if a download is in flight.
      */
     fun dismissSheet() {
-        // Cancel any in-flight download before resetting state.
         downloadJob?.cancel()
         downloadJob = null
 
         _uiState.update { current ->
-            // Keep Idle if already there; reset any terminal/transient state.
             if (current is SelfUpdateUiState.Idle) current else SelfUpdateUiState.Idle
         }
     }
@@ -179,9 +178,16 @@ class AboutViewModel @Inject constructor(
             /** Sidecar SHA-256 URL forwarded from [SelfUpdateResult.Available.sha256Url]. */
             val sha256Url: String?,
         ) : SelfUpdateUiState
-        data class Downloading(val percent: Int) : SelfUpdateUiState
+        // FIX 4: Downloading now carries the version string so the sheet title
+        // "What's new in vX" doesn't regress to "What's new in v" mid-download.
+        data class Downloading(val percent: Int, val version: String) : SelfUpdateUiState
         data object Launching   : SelfUpdateUiState
         data object UpToDate    : SelfUpdateUiState
         data class Failed(val reason: String) : SelfUpdateUiState
+    }
+
+    companion object {
+        /** Minimum interval between Downloading state emissions: ~200ms. */
+        private const val DOWNLOAD_EMIT_THROTTLE_MS = 200L
     }
 }

@@ -6,6 +6,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -16,6 +17,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -30,6 +32,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
@@ -43,7 +47,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -66,6 +69,7 @@ import io.github.mayusi.emutran.data.manifest.AppEntry
 import io.github.mayusi.emutran.data.manifest.SystemTag
 import io.github.mayusi.emutran.ui.common.AppInfoDialog
 import io.github.mayusi.emutran.ui.common.Dimens
+import io.github.mayusi.emutran.ui.common.SmallStatusPill
 import io.github.mayusi.emutran.ui.common.StepIndicator
 import io.github.mayusi.emutran.ui.common.dpadFocusBorder
 import io.github.mayusi.emutran.ui.common.rememberOnResume
@@ -160,6 +164,8 @@ private fun ReadyContent(
     onContinue: () -> Unit,
 ) {
     // Category filter first, then the free-text search on top of it.
+    // FIX #3: sort is the final expression INSIDE remember() so it only runs
+    // when allEntries/filter/search change, not on every recompose.
     val filtered = remember(allEntries, filter, search) {
         val byCategory = filterEntries(allEntries, filter)
         val bySearch = if (search.isBlank()) {
@@ -167,10 +173,13 @@ private fun ReadyContent(
         } else {
             byCategory.filter { it.name.contains(search, ignoreCase = true) }
         }
-        bySearch
-    }.sortedBy { it.name.lowercase() }
+        bySearch.sortedWith(compareBy { it.name.lowercase() })
+    }
 
-    val installedCount = allEntries.count { it.id in installed }
+    // FIX #20: count is memoised so it doesn't run on every recompose.
+    val installedCount = remember(allEntries, installed) {
+        allEntries.count { it.id in installed }
+    }
 
     // D-pad: on first composition, request focus on the first grid card (or
     // Continue if the list is empty). This lets the user navigate immediately
@@ -426,25 +435,32 @@ private fun EntryCard(
         AppInfoDialog(entry = entry) { showInfo = false }
     }
 
-    // InteractionSource shared between the card's focusable + clickable so
+    // InteractionSource shared between the card's focusable + toggleable so
     // the focus ring reflects the card-level focus (not just the checkbox).
     val cardInteraction = remember { MutableInteractionSource() }
     val cardFocused by cardInteraction.collectIsFocusedAsState()
 
-    // Tiny dense card. 96dp tall so 4 rows fit comfortably in the
-    // available picker height. Shows just name + status badge.
+    // Tiny dense card. heightIn(min=96.dp) so it grows with large font scale
+    // instead of clipping text (was fixed height(96.dp)). 4 rows still fit at
+    // default font scale.
+    //
+    // a11y FIX 3: replace separate focusable+clickable with toggleable so that
+    // TalkBack sees ONE focus stop announced as "<name>, checkbox, checked/unchecked".
+    // The inner Checkbox is marked decorative via clearAndSetSemantics so there's
+    // no duplicate focus stop. The info (i) button remains its own focus stop.
     Card(
         modifier = modifier
             .fillMaxWidth()
-            .height(96.dp)
+            .heightIn(min = 96.dp)
             .clip(RoundedCornerShape(12.dp))
-            // focusable first, then clickable — this order ensures the
-            // card captures D-pad ENTER to toggle selection.
-            .focusable(interactionSource = cardInteraction)
-            .clickable(
+            // toggleable gives TalkBack the Role.Checkbox role and checked state
+            // on a single focus stop. D-pad ENTER still toggles selection.
+            .toggleable(
+                value             = checked,
+                role              = Role.Checkbox,
                 interactionSource = cardInteraction,
                 indication        = null,
-                onClick           = onClick,
+                onValueChange     = { onClick() },
             )
             .then(
                 if (cardFocused) Modifier.border(
@@ -466,27 +482,35 @@ private fun EntryCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment     = Alignment.CenterVertically,
             ) {
-                Checkbox(checked = checked, onCheckedChange = { onClick() })
+                // a11y: clearAndSetSemantics so the Checkbox has no independent
+                // semantics node — the card's toggleable is the single focus stop.
+                Checkbox(
+                    checked = checked,
+                    onCheckedChange = { onClick() },
+                    modifier = Modifier.clearAndSetSemantics {},
+                )
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    // FIX #14: use SmallStatusPill (ui/common) instead of the
+                    // now-deleted local SmallBadge duplicate.
                     when {
-                        alreadyInstalled -> SmallBadge(
+                        alreadyInstalled -> SmallStatusPill(
                             text = "Installed",
                             bg   = MaterialTheme.colorScheme.tertiary,
                             fg   = MaterialTheme.colorScheme.onTertiary,
                         )
-                        entry.recommended -> SmallBadge(
+                        entry.recommended -> SmallStatusPill(
                             text = "Rec",
                             bg   = MaterialTheme.colorScheme.secondary,
                             fg   = MaterialTheme.colorScheme.onSecondary,
                         )
                         else -> Unit
                     }
-                    // Info button has its own clickable region — tapping it
-                    // opens the dialog and does NOT toggle the checkbox.
-                    // It is also its own D-pad focus stop (focusable IconButton).
+                    // Info button remains its own D-pad focus stop (focusable IconButton).
+                    // a11y FIX 2: sizeIn enforces 48dp min touch target (was 28dp);
+                    // icon stays at 18dp.
                     IconButton(
                         onClick  = { showInfo = true },
-                        modifier = Modifier.size(28.dp),
+                        modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp),
                     ) {
                         Icon(
                             imageVector     = Icons.Outlined.Info,
@@ -502,27 +526,10 @@ private fun EntryCard(
                 text       = entry.name,
                 style      = MaterialTheme.typography.bodyMedium,
                 fontWeight = FontWeight.SemiBold,
-                maxLines   = 1,
+                maxLines   = 2,
                 overflow   = TextOverflow.Ellipsis,
             )
         }
-    }
-}
-
-@Composable
-private fun SmallBadge(
-    text: String,
-    bg: androidx.compose.ui.graphics.Color,
-    fg: androidx.compose.ui.graphics.Color,
-) {
-    Surface(color = bg, shape = RoundedCornerShape(6.dp)) {
-        Text(
-            text       = text,
-            style      = MaterialTheme.typography.labelSmall,
-            color      = fg,
-            fontWeight = FontWeight.SemiBold,
-            modifier   = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-        )
     }
 }
 

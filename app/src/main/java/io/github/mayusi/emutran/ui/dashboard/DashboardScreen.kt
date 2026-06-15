@@ -13,21 +13,21 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.automirrored.outlined.FactCheck
 import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.outlined.SettingsBackupRestore
+import androidx.compose.material.icons.outlined.NewReleases
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.SystemUpdate
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -35,7 +35,6 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -43,7 +42,6 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Snackbar
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -57,13 +55,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.mayusi.emutran.data.manifest.AppEntry
+import io.github.mayusi.emutran.data.manifest.PendingPackDiff
 import io.github.mayusi.emutran.data.update.SelfUpdateResult
 import io.github.mayusi.emutran.data.update.UpdateInfo
 import io.github.mayusi.emutran.data.update.UpdateProgress
@@ -73,11 +70,12 @@ import io.github.mayusi.emutran.ui.common.CardUninstallButton
 import io.github.mayusi.emutran.ui.common.CardUpdateButton
 import io.github.mayusi.emutran.ui.common.Dimens
 import io.github.mayusi.emutran.ui.common.EmulatorCard
-import io.github.mayusi.emutran.ui.common.MarkdownText
+import io.github.mayusi.emutran.ui.common.SelfUpdateSheet
 import io.github.mayusi.emutran.ui.common.SmallStatusPill
 import io.github.mayusi.emutran.ui.common.UpdateChip
 import io.github.mayusi.emutran.ui.common.dpadFocusBorder
 import io.github.mayusi.emutran.ui.common.rememberOnResume
+import io.github.mayusi.emutran.ui.common.truncatedNames
 import io.github.mayusi.emutran.ui.theme.EmuTones
 
 /**
@@ -85,21 +83,14 @@ import io.github.mayusi.emutran.ui.theme.EmuTones
  * "Installed on this device" (with Update / Uninstall buttons) and
  * "Available to install" (with an Install button).
  *
- * Task 1 fix: Quick Setup button + Re-run TextButton now live inside the
- * Scaffold's `bottomBar` slot, not floating over the grid. The grid
- * receives the Scaffold's innerPadding so it scrolls correctly.
- *
- * Task 2: cards use the new [EmulatorCard] composable with animated D-pad
- * focus (scale spring + border change). Uninstall is ghost/TextButton style.
- *
- * Task 3: update count header + per-card "Update vX" chip sourced from
- * [UpdateRepository] via [DashboardViewModel.updateState].
- *
  * Self-update banner: when [DashboardViewModel.selfUpdate] is Available an
  * inline banner card is inserted above the EmuHelper featured card. Tapping
- * "What's new" opens a [ModalBottomSheet] with the release notes (rendered
- * via [MarkdownText]), a download progress bar, and "Update now" / "Skip this
- * version" / "Not now" actions. Cancel cancels the in-flight download.
+ * "What's new" opens a [ModalBottomSheet] rendered via the shared
+ * [SelfUpdateSheet] composable from ui/common.
+ *
+ * FIX 5: emuHelperInstalled is now collected from a StateFlow (updated off
+ * the main thread by the ViewModel) instead of a synchronous rememberOnResume
+ * that ran a blocking PackageManager scan on the composition thread.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -109,6 +100,7 @@ fun DashboardScreen(
     onAbout: () -> Unit = {},
     onQuickSetup: () -> Unit = {},
     onHealthCheck: () -> Unit = {},
+    onProfile: () -> Unit = {},
     vm: DashboardViewModel = hiltViewModel(),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -119,10 +111,16 @@ fun DashboardScreen(
     val updateProgressMap by vm.updateProgressMap.collectAsStateWithLifecycle()
     val selfUpdate by vm.selfUpdate.collectAsStateWithLifecycle()
     val selfUpdateSheet by vm.selfUpdateSheet.collectAsStateWithLifecycle()
+    val driverHints by vm.driverHints.collectAsStateWithLifecycle()
+    val pendingPackDiff by vm.pendingPackDiff.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
 
-    rememberOnResume { vm.refresh(); true }
-    val emuHelperInstalled by rememberOnResume { vm.isEmuHelperInstalled() }
+    // FIX 5: emuHelperInstalled collected from StateFlow — no blocking PM call.
+    val emuHelperInstalled by vm.emuHelperInstalled.collectAsStateWithLifecycle()
+
+    // Trigger onResume in the ViewModel so it refreshes installed state
+    // (including emuHelperInstalled) on every ON_RESUME.
+    rememberOnResume { vm.onResume(); true }
 
     LaunchedEffect(Unit) {
         vm.userMessage.collect { message ->
@@ -146,8 +144,6 @@ fun DashboardScreen(
                 )
             }
         },
-        // TASK 1 FIX: bottom CTAs live in the Scaffold's bottomBar slot
-        // so they never float over the grid during scroll.
         bottomBar = {
             Column {
                 HorizontalDivider(color = EmuTones.outlineDivider)
@@ -176,8 +172,6 @@ fun DashboardScreen(
         },
         containerColor = MaterialTheme.colorScheme.background,
     ) { innerPadding ->
-        // innerPadding accounts for the bottomBar height, so the grid
-        // content never hides behind the CTA buttons.
         when (val s = state) {
             DashboardViewModel.UiState.Loading -> Loading(innerPadding)
             is DashboardViewModel.UiState.Failed -> Failed(s.message, innerPadding, onRetry = vm::refresh)
@@ -192,39 +186,60 @@ fun DashboardScreen(
                 updateCount = updateCount,
                 updateProgressMap = updateProgressMap,
                 selfUpdate = selfUpdate as? SelfUpdateResult.Available,
+                driverHints = driverHints,
+                pendingPackDiff = pendingPackDiff,
                 onInstallEmuHelper = vm::installEmuHelper,
                 onAddMore = onAddMore,
                 onAbout = onAbout,
                 onHealthCheck = onHealthCheck,
+                onProfile = onProfile,
                 onCheckForUpdates = vm::checkForUpdates,
                 onUpdateAll = vm::updateAll,
-                // FIX 3: installed-card update goes through the repository so the badge clears.
                 onUpdate = { entry -> vm.updateViaRepository(entry.id) },
-                // FIX 4: available-card install uses the renamed downloadAndInstall.
                 onInstall = vm::downloadAndInstall,
                 onUninstall = vm::uninstall,
                 onOpenSelfUpdateSheet = vm::openSelfUpdateSheet,
                 onDismissSelfUpdateBanner = vm::dismissSelfUpdateBanner,
+                onDismissPackDiff = vm::dismissPackDiff,
                 innerPadding = innerPadding,
             )
         }
     }
 
     // ── Self-update "What's new" bottom sheet ──────────────────────────────
-    // Rendered outside the Scaffold so it overlays the full screen correctly.
     if (selfUpdateSheet != null) {
         val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+
+        // Resolve display params from the current sheet state.
+        val sheetVersion = when (val s = selfUpdateSheet) {
+            is DashboardViewModel.SelfUpdateSheetUiState.Available    -> s.version
+            is DashboardViewModel.SelfUpdateSheetUiState.Downloading  -> s.version
+            null -> ""
+        }
+        val sheetChangelog = when (val s = selfUpdateSheet) {
+            is DashboardViewModel.SelfUpdateSheetUiState.Available -> s.changelog
+            else -> ""
+        }
+        val sheetApkUrl = (selfUpdateSheet as? DashboardViewModel.SelfUpdateSheetUiState.Available)?.apkUrl
+        val downloadingPercent = (selfUpdateSheet as? DashboardViewModel.SelfUpdateSheetUiState.Downloading)?.percent
+
         ModalBottomSheet(
             onDismissRequest = vm::dismissSelfUpdateSheet,
             sheetState = sheetState,
             containerColor = EmuTones.containerHighest,
             contentColor = EmuTones.onSurface,
         ) {
-            DashboardSelfUpdateSheetContent(
-                available = selfUpdateSheet as? DashboardViewModel.SelfUpdateSheetUiState.Available,
-                downloading = selfUpdateSheet as? DashboardViewModel.SelfUpdateSheetUiState.Downloading,
-                onUpdateNow = { url -> vm.startSelfUpdateDownload(url) },
-                onSkip = { version -> vm.skipSelfUpdate(version) },
+            // FIX 4: shared SelfUpdateSheet composable — no more per-screen duplication.
+            SelfUpdateSheet(
+                version = sheetVersion,
+                changelogMarkdown = sheetChangelog,
+                downloadingPercent = downloadingPercent,
+                onUpdateNow = {
+                    sheetApkUrl?.let { vm.startSelfUpdateDownload(it) }
+                },
+                onSkip = if (sheetVersion.isNotBlank()) {
+                    { vm.skipSelfUpdate(sheetVersion) }
+                } else null,
                 onDismiss = vm::dismissSelfUpdateSheet,
             )
         }
@@ -256,7 +271,6 @@ private fun Failed(message: String, innerPadding: PaddingValues, onRetry: () -> 
             color = MaterialTheme.colorScheme.error,
         )
         Text(message, style = MaterialTheme.typography.bodyMedium)
-        // FIX 3: Failed state must not be a dead-end — provide a retry affordance.
         val retryInteraction = remember { MutableInteractionSource() }
         Button(
             onClick = onRetry,
@@ -281,24 +295,27 @@ private fun Ready(
     updateCount: Int,
     updateProgressMap: Map<String, UpdateProgress>,
     selfUpdate: SelfUpdateResult.Available?,
+    driverHints: Map<String, String>,
+    pendingPackDiff: PendingPackDiff?,
     onInstallEmuHelper: () -> Unit,
     onAddMore: () -> Unit,
     onAbout: () -> Unit,
     onHealthCheck: () -> Unit,
+    onProfile: () -> Unit,
     onCheckForUpdates: () -> Unit,
     onUpdateAll: () -> Unit,
-    onUpdate: (AppEntry) -> Unit,          // installed-card update (repository-driven, clears badge)
-    onInstall: (AppEntry) -> Unit,         // available-card install (direct download path)
+    onUpdate: (AppEntry) -> Unit,
+    onInstall: (AppEntry) -> Unit,
     onUninstall: (AppEntry) -> Unit,
     onOpenSelfUpdateSheet: () -> Unit,
     onDismissSelfUpdateBanner: () -> Unit,
+    onDismissPackDiff: () -> Unit,
     innerPadding: PaddingValues,
 ) {
-    val installedEntries = entries.filter { it.id in installedIds }
-    val availableEntries = entries.filter { it.id !in installedIds }
+    val installedEntries = remember(entries, installedIds) { entries.filter { it.id in installedIds } }
+    val availableEntries = remember(entries, installedIds) { entries.filter { it.id !in installedIds } }
 
     Column(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
-        // Compact one-row header.
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -326,11 +343,17 @@ private fun Ready(
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            // Health Check icon button — lets the user verify their setup at any time.
             IconButton(onClick = onHealthCheck) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Outlined.FactCheck,
                     contentDescription = "Setup Health Check",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            IconButton(onClick = onProfile) {
+                Icon(
+                    imageVector = Icons.Outlined.SettingsBackupRestore,
+                    contentDescription = "Backup or restore setup profile",
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
@@ -346,7 +369,6 @@ private fun Ready(
 
         HorizontalDivider(color = EmuTones.outlineDivider)
 
-        // Update-count hero: only visible when at least one update is available.
         if (updateCount > 0) {
             UpdateHeroBanner(
                 updateCount = updateCount,
@@ -356,19 +378,22 @@ private fun Ready(
             HorizontalDivider(color = EmuTones.outlineDivider)
         }
 
-        // Grid — receives innerPadding so it scrolls correctly above the bottom bar.
         LazyVerticalGrid(
             columns = GridCells.Fixed(2),
             modifier = Modifier.weight(1f).padding(horizontal = 10.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
-            contentPadding = PaddingValues(
-                top = 8.dp,
-                bottom = 8.dp,
-            ),
+            contentPadding = PaddingValues(top = 8.dp, bottom = 8.dp),
         ) {
-            // Self-update banner — shown above the EmuHelper card when a new
-            // EmuTran release is available (and not dismissed this session).
+            if (pendingPackDiff != null) {
+                item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(2) }) {
+                    ManifestDiffBanner(
+                        diff = pendingPackDiff,
+                        onDismiss = onDismissPackDiff,
+                    )
+                }
+            }
+
             if (selfUpdate != null) {
                 item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(2) }) {
                     SelfUpdateBanner(
@@ -379,7 +404,6 @@ private fun Ready(
                 }
             }
 
-            // Featured EmuHelper card pinned to the very top.
             item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(2) }) {
                 EmuHelperCard(
                     entry = emuHelper,
@@ -398,8 +422,7 @@ private fun Ready(
                         busy = entry.id in busy,
                         updateInfo = updateState[entry.id],
                         updateProgress = updateProgressMap[entry.id],
-                        // FIX 3: use repository-driven path so the update badge is
-                        // cleared from persisted state after a successful update.
+                        driverHint = driverHints[entry.id],
                         onUpdate = { onUpdate(entry) },
                         onUninstall = { onUninstall(entry) },
                     )
@@ -413,8 +436,6 @@ private fun Ready(
                     AvailableCard(
                         entry = entry,
                         busy = entry.id in busy,
-                        // FIX 4: AvailableCard "Install" uses the direct download path
-                        // (no persisted badge to clear for a not-yet-installed app).
                         onInstall = { onInstall(entry) },
                     )
                 }
@@ -455,10 +476,10 @@ private fun UpdateHeroBanner(
                 color = EmuTones.onSurface,
             )
         }
-        // "Check now" — dim icon button
+        // a11y: sizeIn enforces 48dp min touch target (was 36dp); icon stays at 18dp.
         IconButton(
             onClick = onCheckNow,
-            modifier = Modifier.size(36.dp),
+            modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp),
         ) {
             Icon(
                 imageVector = Icons.Outlined.Refresh,
@@ -482,16 +503,6 @@ private fun UpdateHeroBanner(
 
 // ── Self-update banner ────────────────────────────────────────────────────────
 
-/**
- * Inline dismissible card shown above the EmuHelper featured card when a new
- * EmuTran release is available. Monochrome: uses [EmuTones.containerHigh] as
- * the card surface so it sits one elevation step above the page background,
- * giving it visual prominence without any hue.
- *
- * D-pad: "What's new" button has focus priority; the dismiss icon is also
- * focusable. Both actions call their respective lambdas and do NOT navigate
- * away.
- */
 @Composable
 private fun SelfUpdateBanner(
     version: String,
@@ -531,7 +542,6 @@ private fun SelfUpdateBanner(
                 )
             }
             Spacer(Modifier.width(4.dp))
-            // "What's new" — opens the patch-notes sheet.
             val whatsNewInteraction = remember { MutableInteractionSource() }
             TextButton(
                 onClick = onWhatsNew,
@@ -544,10 +554,10 @@ private fun SelfUpdateBanner(
                     color = EmuTones.onSurface,
                 )
             }
-            // Dismiss (x) — session-only hide, does NOT persist skip.
+            // a11y: sizeIn enforces 48dp min touch target (was 32dp); icon stays at 18dp.
             IconButton(
                 onClick = onDismiss,
-                modifier = Modifier.size(32.dp),
+                modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp),
             ) {
                 Icon(
                     imageVector = Icons.Outlined.Close,
@@ -560,129 +570,76 @@ private fun SelfUpdateBanner(
     }
 }
 
-// ── Self-update bottom sheet ──────────────────────────────────────────────────
+// ── Manifest "what's new" banner ──────────────────────────────────────────────
 
 /**
- * Patch-notes + install sheet for the dashboard self-update flow.
- *
- * Layout mirrors [AboutScreen]'s SelfUpdateSheetContent but is self-contained
- * here — no shared composable in ui/common so the About screen's copy is
- * untouched. The changelog is rendered via [MarkdownText] for proper
- * headers/bullets/bold/link support.
- *
- * Download cancellation: the owning [DashboardViewModel] stores the download
- * [Job] and cancels it when [onDismiss] is called via [dismissSelfUpdateSheet],
- * so the system installer is never launched after the user closes the sheet.
+ * Dismissible catalog-update banner. Mirrors [SelfUpdateBanner]'s monochrome
+ * style. Reads e.g. "Catalog updated — added: Vita3K, Xemu · removed: ARMSX2",
+ * truncating long lists to a few names + "+N more". The (x) calls [onDismiss]
+ * which clears the pending diff in the ViewModel.
  */
 @Composable
-private fun DashboardSelfUpdateSheetContent(
-    available  : DashboardViewModel.SelfUpdateSheetUiState.Available?,
-    downloading: DashboardViewModel.SelfUpdateSheetUiState.Downloading?,
-    onUpdateNow: (apkUrl: String) -> Unit,
-    onSkip     : (version: String) -> Unit,
-    onDismiss  : () -> Unit,
+private fun ManifestDiffBanner(
+    diff: PendingPackDiff,
+    onDismiss: () -> Unit,
 ) {
-    val version  = available?.version  ?: ""
-    val changelog = available?.changelog ?: ""
-    val apkUrl   = available?.apkUrl
+    val summary = remember(diff) { manifestDiffSummary(diff) }
 
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 24.dp)
-            .padding(top = 8.dp, bottom = 24.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = EmuTones.containerHigh),
+        border = BorderStroke(1.dp, EmuTones.outlineDivider),
     ) {
-        Text(
-            text = "What's new in v$version",
-            style = MaterialTheme.typography.titleLarge,
-            fontWeight = FontWeight.Bold,
-            color = EmuTones.onSurface,
-        )
-
-        if (changelog.isNotBlank()) {
-            // Render release notes with MarkdownText — headers/bullets/links
-            // in GitHub release bodies display correctly.
-            MarkdownText(
-                markdown = changelog,
-                modifier = Modifier.fillMaxWidth(),
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.NewReleases,
+                contentDescription = null,
+                tint = EmuTones.onSurface,
+                modifier = Modifier.size(20.dp),
             )
-        }
-
-        // Download progress bar — shown when in Downloading state.
-        if (downloading != null) {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                LinearProgressIndicator(
-                    progress = { downloading.percent / 100f },
-                    modifier = Modifier.fillMaxWidth(),
+            Spacer(Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Catalog updated",
+                    style = MaterialTheme.typography.titleSmall,
                     color = EmuTones.onSurface,
-                    trackColor = EmuTones.outlineDivider,
+                    fontWeight = FontWeight.Bold,
                 )
                 Text(
-                    text = "Downloading… ${downloading.percent}%",
-                    style = MaterialTheme.typography.labelMedium,
+                    text = summary,
+                    style = MaterialTheme.typography.bodySmall,
                     color = EmuTones.onSurfaceVar,
                 )
             }
-        }
-
-        // Action buttons row.
-        if (available != null) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                val updateInteraction = remember { MutableInteractionSource() }
-                Button(
-                    onClick = { onUpdateNow(available.apkUrl) },
-                    interactionSource = updateInteraction,
-                    modifier = Modifier
-                        .weight(1f)
-                        .heightIn(min = Dimens.ButtonMinHeight)
-                        .dpadFocusBorder(updateInteraction, cornerRadius = 50.dp),
-                ) { Text("Update now") }
-
-                val skipInteraction = remember { MutableInteractionSource() }
-                OutlinedButton(
-                    onClick = { onSkip(available.version) },
-                    interactionSource = skipInteraction,
-                    modifier = Modifier
-                        .weight(1f)
-                        .heightIn(min = Dimens.ButtonMinHeight)
-                        .dpadFocusBorder(skipInteraction, cornerRadius = 50.dp),
-                ) { Text("Skip version") }
-            }
-            val dismissInteraction = remember { MutableInteractionSource() }
-            TextButton(
+            Spacer(Modifier.width(4.dp))
+            // a11y: sizeIn enforces 48dp min touch target; icon stays at 18dp.
+            IconButton(
                 onClick = onDismiss,
-                interactionSource = dismissInteraction,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .dpadFocusBorder(dismissInteraction, cornerRadius = 8.dp),
+                modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp),
             ) {
-                Text(
-                    "Not now",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = EmuTones.onSurfaceVar,
+                Icon(
+                    imageVector = Icons.Outlined.Close,
+                    contentDescription = "Dismiss catalog update notification",
+                    tint = EmuTones.onSurfaceVar,
+                    modifier = Modifier.size(18.dp),
                 )
             }
-        }
-
-        // While downloading, only show a "Downloading…" disabled button.
-        if (downloading != null) {
-            val cancelInteraction = remember { MutableInteractionSource() }
-            OutlinedButton(
-                onClick = onDismiss,
-                enabled = false,
-                interactionSource = cancelInteraction,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = Dimens.ButtonMinHeight)
-                    .dpadFocusBorder(cancelInteraction, cornerRadius = 50.dp),
-            ) { Text("Downloading…") }
         }
     }
+}
+
+/** Build a compact "added: … · removed: …" summary, truncating long lists. */
+private fun manifestDiffSummary(diff: PendingPackDiff): String {
+    val parts = mutableListOf<String>()
+    if (diff.added.isNotEmpty()) parts += "added: " + truncatedNames(diff.added)
+    if (diff.removed.isNotEmpty()) parts += "removed: " + truncatedNames(diff.removed)
+    return parts.joinToString("  •  ")
 }
 
 // ── Card variants ────────────────────────────────────────────────────────────
@@ -697,9 +654,7 @@ private fun EmuHelperCard(
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(14.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = EmuTones.container,
-        ),
+        colors = CardDefaults.cardColors(containerColor = EmuTones.container),
         border = BorderStroke(1.dp, EmuTones.outlineDivider),
     ) {
         Column(
@@ -773,6 +728,7 @@ private fun InstalledCard(
     busy: Boolean,
     updateInfo: UpdateInfo?,
     updateProgress: UpdateProgress?,
+    driverHint: String?,
     onUpdate: () -> Unit,
     onUninstall: () -> Unit,
 ) {
@@ -781,15 +737,12 @@ private fun InstalledCard(
         AppInfoDialog(entry = entry, onDismiss = { showInfo = false })
     }
 
-    // Determine the label for the Update button:
-    // If there's a newer version tag, show "Update v1.2" style text.
     val updateButtonLabel = updateInfo?.let { info ->
         if (info.hasUpdate && info.availableVersion != null) {
             "v${info.availableVersion!!.trimStart('v', 'V')}"
         } else null
     }
 
-    // Per-card progress from the repository update path.
     val inRepositoryProgress = updateProgress != null &&
         updateProgress !is UpdateProgress.Done &&
         updateProgress !is UpdateProgress.Cancelled
@@ -803,21 +756,18 @@ private fun InstalledCard(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                // "Installed" badge — near-white tertiary pill (tertiary = #D0D0D0 bg).
                 SmallStatusPill(
                     text = "Installed",
                     bg = MaterialTheme.colorScheme.tertiary,
                     fg = MaterialTheme.colorScheme.onTertiary,
                 )
-                // Update badge: outlined chip shown only when an update is available
-                // and no in-flight progress for this entry.
                 if (updateInfo?.hasUpdate == true && !inRepositoryProgress) {
                     UpdateChip(text = "Update")
                 }
-                // Info button
+                // a11y: sizeIn enforces 48dp min touch target; icon stays at 18dp.
                 IconButton(
                     onClick = { showInfo = true },
-                    modifier = Modifier.size(28.dp),
+                    modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp),
                 ) {
                     Icon(
                         imageVector = Icons.Outlined.Info,
@@ -829,7 +779,15 @@ private fun InstalledCard(
             }
         },
         bottomContent = {
-            // Show progress text if repository-driven update is in flight.
+            // Subtle per-emulator driver hint (Adreno only). Sits above the
+            // action row; absent for non-Adreno GPUs / unknown emulators.
+            if (driverHint != null) {
+                Text(
+                    text = driverHint,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = EmuTones.onSurfaceVar,
+                )
+            }
             if (inRepositoryProgress) {
                 Text(
                     text = when (updateProgress) {
@@ -884,9 +842,10 @@ private fun AvailableCard(
         secondaryLine = entry.system.display,
         onClick = { showInfo = true },
         topEndBadge = {
+            // a11y: sizeIn enforces 48dp min touch target; icon stays at 18dp.
             IconButton(
                 onClick = { showInfo = true },
-                modifier = Modifier.size(28.dp),
+                modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp),
             ) {
                 Icon(
                     imageVector = Icons.Outlined.Info,

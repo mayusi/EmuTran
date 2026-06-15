@@ -5,6 +5,10 @@ import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
 import io.github.mayusi.emutran.data.auth.GithubTokenStore
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.serialization.json.Json
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Response
@@ -49,6 +53,38 @@ object AppModule {
             // Security boundary: only attaches the PAT to api.github.com.
             .addInterceptor(GithubAuthInterceptor(githubTokenStore))
             .build()
+
+    /**
+     * Single shared kotlinx.serialization [Json] used by every data-layer
+     * component that parses JSON (GitHub/Gitea release DTOs, the HTTP cache,
+     * the self-update repository, the manifest-diff store, the driver stager).
+     *
+     * [ignoreUnknownKeys] = true because the upstream APIs (GitHub, Gitea) send
+     * many fields we don't model; a single configured instance avoids the cost
+     * (and the duplication) of constructing one per class.
+     *
+     * Note: ProfileRepository and ObtainiumPackParser deliberately keep their
+     * own Json with different options — they are NOT wired to this provider.
+     */
+    @Provides
+    @Singleton
+    fun provideJson(): Json = Json { ignoreUnknownKeys = true }
+
+    /**
+     * Application-scoped CoroutineScope (SupervisorJob + Dispatchers.IO) that
+     * lives for the whole process. Backs eagerly-started StateFlows that must
+     * keep collecting for the app's lifetime (e.g. the GitHub token cache in
+     * [GithubTokenStore]). A [SupervisorJob] means a child failure never
+     * cancels the scope.
+     *
+     * Provided here (rather than constructed inline) so the classes that use it
+     * stay testable — a test can inject a controlled scope.
+     */
+    @Provides
+    @Singleton
+    @ApplicationScope
+    fun provideApplicationScope(): CoroutineScope =
+        CoroutineScope(SupervisorJob() + Dispatchers.IO)
 }
 
 /**

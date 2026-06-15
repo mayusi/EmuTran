@@ -14,12 +14,23 @@ import kotlinx.serialization.json.Json
 import javax.inject.Inject
 import javax.inject.Singleton
 
+// FIX 1a: two separate DataStore files.
+//
+//   emutran_update_state  — per-entry JSON blobs only (the allUpdateInfo() flow).
+//   emutran_update_meta   — scalar keys (selfCheckEpoch, dismissedVersion,
+//                           lastNotifiedSignature) so a write to a scalar key
+//                           does NOT re-emit allUpdateInfo() and trigger O(n)
+//                           re-decodes of every entry blob.
+//
 private val Context.updateStateDataStore by preferencesDataStore(name = "emutran_update_state")
+private val Context.updateMetaDataStore  by preferencesDataStore(name = "emutran_update_meta")
 
 /**
  * Persists per-entry update check results in DataStore so they survive
- * process death. One JSON blob per entry id, plus a single
- * "last self-check epoch" for [SelfUpdateRepository].
+ * process death. One JSON blob per entry id, plus scalar meta keys
+ * (selfCheckEpoch, dismissedSelfUpdateVersion, lastNotifiedSignature)
+ * in a separate DataStore file so writing them does NOT trigger
+ * allUpdateInfo() re-emission (FIX 1).
  *
  * Using a separate DataStore from emutran_setup_options / emutran_selection
  * so a future "reset" wipe doesn't clear update metadata.
@@ -51,16 +62,22 @@ class UpdateStateStore @Inject constructor(
 
     /**
      * Emit the full map of persisted update info, keyed by entryId.
-     * Emits on every change (DataStore is reactive). The map only contains
-     * entries that have been written at least once.
+     * Emits on every change to emutran_update_state (DataStore is reactive).
+     * The map only contains entries that have been written at least once.
+     *
+     * FIX 1: scalar keys (selfCheckEpoch, dismissedVersion,
+     * lastNotifiedSignature) now live in emutran_update_meta, so a write
+     * to those keys no longer re-triggers this flow.
      */
     fun allUpdateInfo(): Flow<Map<String, PersistedUpdateInfo>> =
         context.updateStateDataStore.data.map { prefs ->
+            // FIX 9: iterate entries and read the value directly — no second
+            // preference-key rebuild + lookup per entry.
             prefs.asMap()
-                .keys
-                .filter { it.name.startsWith(ENTRY_PREFIX) }
-                .mapNotNull { key ->
-                    val raw = prefs[stringPreferencesKey(key.name)] ?: return@mapNotNull null
+                .entries
+                .filter { it.key.name.startsWith(ENTRY_PREFIX) }
+                .mapNotNull { (_, value) ->
+                    val raw = value as? String ?: return@mapNotNull null
                     runCatching { json.decodeFromString<PersistedUpdateInfo>(raw) }.getOrNull()
                 }
                 .associateBy { it.entryId }
@@ -81,18 +98,33 @@ class UpdateStateStore @Inject constructor(
         }
     }
 
-    // ── Self-update last-check epoch ───────────────────────────────────────
+    /**
+     * FIX 1b: Bulk-write all entries in ONE DataStore transaction (1 emission
+     * instead of N). UpdateRepository.checkNow() collects results in memory
+     * then calls this once so 30 entries produce 1 DataStore write, not 30.
+     */
+    suspend fun putAllUpdateInfo(infos: List<PersistedUpdateInfo>) {
+        if (infos.isEmpty()) return
+        context.updateStateDataStore.edit { prefs ->
+            for (info in infos) {
+                prefs[entryKey(info.entryId)] =
+                    json.encodeToString(PersistedUpdateInfo.serializer(), info)
+            }
+        }
+    }
+
+    // ── Self-update last-check epoch (scalar → meta store) ─────────────────
 
     private val selfCheckEpochKey = longPreferencesKey("self_update_last_checked_epoch")
 
     val selfCheckLastEpoch: Flow<Long> =
-        context.updateStateDataStore.data.map { it[selfCheckEpochKey] ?: 0L }
+        context.updateMetaDataStore.data.map { it[selfCheckEpochKey] ?: 0L }
 
     suspend fun setSelfCheckEpoch(epochMs: Long) {
-        context.updateStateDataStore.edit { it[selfCheckEpochKey] = epochMs }
+        context.updateMetaDataStore.edit { it[selfCheckEpochKey] = epochMs }
     }
 
-    // ── Self-update skip-this-version ──────────────────────────────────────
+    // ── Self-update skip-this-version (scalar → meta store) ───────────────
 
     /**
      * Persists the version string the user chose to skip ("Not now" / "Later").
@@ -110,14 +142,16 @@ class UpdateStateStore @Inject constructor(
         stringPreferencesKey("self_update_dismissed_version")
 
     val dismissedSelfUpdateVersion: Flow<String?> =
-        context.updateStateDataStore.data.map { it[dismissedSelfUpdateVersionKey] }
+        context.updateMetaDataStore.data.map { it[dismissedSelfUpdateVersionKey] }
 
     /**
      * Persist [version] as the version to skip, or pass null to clear the skip
-     * (e.g. when a new release supersedes the skipped one).
+     * (e.g. when a new release supersedes the skipped one — though currently this is
+     * not called automatically; the dismissal flows naturally when a newer
+     * release appears with a different version string).
      */
     suspend fun setDismissedSelfUpdateVersion(version: String?) {
-        context.updateStateDataStore.edit { prefs ->
+        context.updateMetaDataStore.edit { prefs ->
             if (version == null) {
                 prefs.remove(dismissedSelfUpdateVersionKey)
             } else {
@@ -126,7 +160,7 @@ class UpdateStateStore @Inject constructor(
         }
     }
 
-    // ── Notification deduplication signature ──────────────────────────────
+    // ── Notification deduplication signature (scalar → meta store) ────────
 
     /**
      * Stable signature of the update set that was most recently notified to
@@ -137,11 +171,6 @@ class UpdateStateStore @Inject constructor(
      *
      * null means we have never sent an update notification, so the first check
      * that finds updates will always notify.
-     *
-     * Cleared implicitly when a new signature is written; we do NOT clear it
-     * on "no updates" — if the user installs an update manually the badge
-     * disappears and we'll see an empty set on the next check, which is a
-     * different signature and won't trigger a spurious re-notify.
      */
     private val lastNotifiedSignatureKey =
         stringPreferencesKey("update_last_notified_signature")
@@ -152,15 +181,14 @@ class UpdateStateStore @Inject constructor(
      * been posted.
      */
     suspend fun getLastNotifiedSignature(): String? =
-        context.updateStateDataStore.data.first()[lastNotifiedSignatureKey]
+        context.updateMetaDataStore.data.first()[lastNotifiedSignatureKey]
 
     /**
      * Persist [signature] as the marker for the set of updates that were
-     * most recently notified. Pass the sorted-join of "entryId:availableVersion"
-     * pairs for every entry with a pending update.
+     * most recently notified.
      */
     suspend fun setLastNotifiedSignature(signature: String) {
-        context.updateStateDataStore.edit { prefs ->
+        context.updateMetaDataStore.edit { prefs ->
             prefs[lastNotifiedSignatureKey] = signature
         }
     }

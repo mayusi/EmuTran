@@ -9,7 +9,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -20,13 +19,14 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Visibility
+import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -43,6 +43,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -51,33 +52,31 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.mayusi.emutran.BuildConfig
+import io.github.mayusi.emutran.data.auth.GithubTokenStore
 import io.github.mayusi.emutran.ui.common.Dimens
-import io.github.mayusi.emutran.ui.common.MarkdownText
+import io.github.mayusi.emutran.ui.common.SelfUpdateSheet
 import io.github.mayusi.emutran.ui.common.dpadFocusBorder
 import io.github.mayusi.emutran.ui.common.dpadFocusable
 import io.github.mayusi.emutran.ui.theme.EmuTones
+import kotlinx.coroutines.launch
 
 private const val GITHUB_URL = "https://github.com/mayusi/EmuTran"
 
 /**
  * About / version screen.
  *
- * Task 4 A6 additions:
- *  - "Check for updates" button wired to [AboutViewModel.checkForSelfUpdate].
- *  - If [SelfUpdateUiState.Available], a [ModalBottomSheet] "What's new" sheet
- *    appears showing version + changelog (plain text) and an "Update now" button
- *    that starts the APK download + system installer.
- *  - If [SelfUpdateUiState.UpToDate] → snackbar "You're on the latest version".
- *  - If [SelfUpdateUiState.Failed]   → snackbar with the reason.
- *  - Reduced whitespace (removed excessive Spacers between sections).
- *  - Fixed the "View on GitHub" button's leading-space hack (was using "  text"
- *    instead of Modifier.padding or a proper Spacer).
+ * Self-update sheet is now rendered via the shared [SelfUpdateSheet] composable
+ * from ui/common (FIX 4), eliminating the previous duplication between this
+ * screen and the dashboard.
  *
- * Pure monochrome — no color introduced.
+ * The GitHub PAT section ([GithubTokenSection]) is left intact — only the
+ * self-update sheet composable was replaced.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -107,7 +106,6 @@ fun AboutScreen(
                 snackbarHostState.showSnackbar("Opening system installer…")
             else -> Unit
         }
-        // After showing the snackbar, reset to Idle so the message can fire again.
         if (uiState is AboutViewModel.SelfUpdateUiState.UpToDate ||
             uiState is AboutViewModel.SelfUpdateUiState.Failed ||
             uiState is AboutViewModel.SelfUpdateUiState.Launching
@@ -197,7 +195,6 @@ fun AboutScreen(
                     contentDescription = null,
                     modifier = Modifier.size(18.dp),
                 )
-                // Fixed: use a proper Spacer instead of leading-space string hack.
                 Spacer(Modifier.width(8.dp))
                 Text(
                     text = "View on GitHub",
@@ -240,6 +237,7 @@ fun AboutScreen(
             // ── GitHub rate-limit token ────────────────────────────────────
             GithubTokenSection(
                 currentToken = githubToken,
+                snackbarHostState = snackbarHostState,
                 onSave = { vm.setGithubToken(it) },
                 onClear = { vm.clearGithubToken() },
             )
@@ -268,24 +266,36 @@ fun AboutScreen(
     }
 
     // ── "What's new" bottom sheet ──────────────────────────────────────────
+    // FIX 4: replaced the local SelfUpdateSheetContent composable with the shared
+    // SelfUpdateSheet from ui/common. The Available/Downloading states are resolved
+    // here and passed as primitive params.
     val available = uiState as? AboutViewModel.SelfUpdateUiState.Available
     val downloading = uiState as? AboutViewModel.SelfUpdateUiState.Downloading
     val showSheet = available != null || downloading != null
 
     if (showSheet) {
         val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+
+        // Resolve display params — version is carried by both Available and Downloading.
+        val sheetVersion = available?.version ?: downloading?.version ?: ""
+        val sheetChangelog = available?.changelog ?: ""
+        val sheetApkUrl = available?.apkUrl
+        val downloadingPercent = downloading?.percent
+
         ModalBottomSheet(
             onDismissRequest = vm::dismissSheet,
             sheetState = sheetState,
             containerColor = EmuTones.containerHighest,
             contentColor = EmuTones.onSurface,
         ) {
-            SelfUpdateSheetContent(
-                available = available,
-                downloading = downloading,
-                onUpdateNow = { url ->
-                    vm.downloadAndInstall(url)
-                },
+            // About screen does NOT have a "Skip this release" flow (no banner to skip).
+            // Pass onSkip = null so the button is hidden.
+            SelfUpdateSheet(
+                version = sheetVersion,
+                changelogMarkdown = sheetChangelog,
+                downloadingPercent = downloadingPercent,
+                onUpdateNow = { sheetApkUrl?.let { vm.downloadAndInstall(it) } },
+                onSkip = null,
                 onDismiss = vm::dismissSheet,
             )
         }
@@ -296,9 +306,6 @@ fun AboutScreen(
 
 /**
  * Returns a masked display string for a GitHub PAT.
- * Shows the first 4 characters + bullet dots + last 4 characters so the
- * user can confirm which token is stored without exposing the full secret.
- * Example: "ghp_••••••••1a2b"
  */
 private fun maskToken(token: String): String {
     if (token.length <= 8) return "••••••••"
@@ -310,24 +317,24 @@ private fun maskToken(token: String): String {
 /**
  * Renders the optional GitHub PAT configuration UI.
  *
- * When no token is stored: shows an explainer + an [OutlinedTextField] for
- * the user to paste a token + a "Save" button.
+ * When no token is stored: shows an explainer + a masked [OutlinedTextField]
+ * (with show/hide toggle) for the user to paste a token + a "Save" button.
  *
  * When a token is already stored: shows the masked token + a "Clear" button.
- * The user must clear the existing token before entering a new one (avoids
- * a partially-typed replacement leaking into the interceptor mid-edit).
  *
- * Monochrome, D-pad focusable (field + buttons both navigable).
+ * Monochrome, D-pad focusable.
  */
 @Composable
 private fun GithubTokenSection(
     currentToken: String?,
+    snackbarHostState: SnackbarHostState,
     onSave: (String) -> Unit,
     onClear: () -> Unit,
 ) {
-    // Local draft state — only committed to the store on explicit Save tap.
     var draft by rememberSaveable { mutableStateOf("") }
+    var showToken by rememberSaveable { mutableStateOf(false) }
     val hasToken = !currentToken.isNullOrBlank()
+    val scope = rememberCoroutineScope()
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(
@@ -345,7 +352,6 @@ private fun GithubTokenSection(
         )
 
         if (hasToken) {
-            // Token already set — show masked value + Clear button.
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -370,7 +376,6 @@ private fun GithubTokenSection(
                 }
             }
         } else {
-            // No token set — show text field + Save button.
             OutlinedTextField(
                 value = draft,
                 onValueChange = { draft = it },
@@ -382,6 +387,18 @@ private fun GithubTokenSection(
                     )
                 },
                 singleLine = true,
+                visualTransformation = if (showToken) VisualTransformation.None
+                                       else PasswordVisualTransformation(),
+                trailingIcon = {
+                    IconButton(onClick = { showToken = !showToken }) {
+                        Icon(
+                            imageVector = if (showToken) Icons.Outlined.VisibilityOff
+                                          else Icons.Outlined.Visibility,
+                            contentDescription = if (showToken) "Hide token" else "Show token",
+                            tint = EmuTones.onSurfaceVar,
+                        )
+                    }
+                },
                 colors = OutlinedTextFieldDefaults.colors(
                     focusedTextColor = EmuTones.onSurface,
                     unfocusedTextColor = EmuTones.onSurface,
@@ -395,12 +412,23 @@ private fun GithubTokenSection(
                     .dpadFocusable(cornerRadius = 4.dp),
             )
 
+            if (draft.isNotBlank() && !GithubTokenStore.looksLikeValidPat(draft)) {
+                Text(
+                    text = "Token format looks unusual — expected ghp_, github_pat_, or similar. " +
+                        "It will still be saved.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = EmuTones.onSurfaceVar,
+                )
+            }
+
             val saveInteraction = remember { MutableInteractionSource() }
             Button(
                 onClick = {
                     if (draft.isNotBlank()) {
                         onSave(draft)
                         draft = ""
+                        showToken = false
+                        scope.launch { snackbarHostState.showSnackbar("Token saved") }
                     }
                 },
                 enabled = draft.isNotBlank(),
@@ -410,93 +438,6 @@ private fun GithubTokenSection(
                     .dpadFocusBorder(saveInteraction, cornerRadius = 50.dp),
             ) {
                 Text("Save token", style = MaterialTheme.typography.labelLarge)
-            }
-        }
-    }
-}
-
-// ── Self-update bottom sheet content ────────────────────────────────────────
-
-@Composable
-private fun SelfUpdateSheetContent(
-    available: AboutViewModel.SelfUpdateUiState.Available?,
-    downloading: AboutViewModel.SelfUpdateUiState.Downloading?,
-    onUpdateNow: (apkUrl: String) -> Unit,
-    onDismiss: () -> Unit,
-) {
-    val version = available?.version ?: downloading?.let { "…" } ?: ""
-    val changelog = available?.changelog ?: ""
-    val apkUrl = available?.apkUrl
-
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 24.dp)
-            .padding(top = 8.dp, bottom = 24.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Text(
-            text = "What's new in v$version",
-            style = MaterialTheme.typography.titleLarge,
-            color = EmuTones.onSurface,
-        )
-
-        if (changelog.isNotBlank()) {
-            // Render with MarkdownText so headers, bullets, bold, and links
-            // in the GitHub release body display correctly instead of raw syntax.
-            MarkdownText(
-                markdown = changelog,
-                modifier = Modifier.fillMaxWidth(),
-            )
-        }
-
-        // Download progress bar (shown when in Downloading state).
-        if (downloading != null) {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                LinearProgressIndicator(
-                    progress = { downloading.percent / 100f },
-                    modifier = Modifier.fillMaxWidth(),
-                    color = EmuTones.onSurface,
-                    trackColor = EmuTones.outlineDivider,
-                )
-                Text(
-                    text = "Downloading… ${downloading.percent}%",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = EmuTones.onSurfaceVar,
-                )
-            }
-        }
-
-        // "Update now" / "Not now" row.
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            if (available != null) {
-                val updateInteraction = remember { MutableInteractionSource() }
-                Button(
-                    onClick = { onUpdateNow(available.apkUrl) },
-                    interactionSource = updateInteraction,
-                    modifier = Modifier
-                        .weight(1f)
-                        .heightIn(min = Dimens.ButtonMinHeight)
-                        .dpadFocusBorder(updateInteraction, cornerRadius = 50.dp),
-                ) {
-                    Text("Update now")
-                }
-            }
-
-            val dismissInteraction = remember { MutableInteractionSource() }
-            OutlinedButton(
-                onClick = onDismiss,
-                enabled = downloading == null,
-                interactionSource = dismissInteraction,
-                modifier = Modifier
-                    .weight(1f)
-                    .heightIn(min = Dimens.ButtonMinHeight)
-                    .dpadFocusBorder(dismissInteraction, cornerRadius = 50.dp),
-            ) {
-                Text(if (downloading != null) "Downloading…" else "Not now")
             }
         }
     }

@@ -33,4 +33,30 @@ class FolderSpecTest {
     fun `no duplicate folder entries`() {
         assertThat(FolderSpec.tree).containsNoDuplicates()
     }
+
+    @Test
+    fun `biosFilesBySystem strips notes and skips prose`() {
+        // Parenthetical region/optional notes are stripped to clean filenames.
+        assertThat(FolderSpec.biosFilesBySystem["ps1"])
+            .containsExactly("scph1001.bin", "scph5501.bin", "scph7001.bin", "scph1002.bin")
+        assertThat(FolderSpec.biosFilesBySystem["gba"]).containsExactly("gba_bios.bin")
+        assertThat(FolderSpec.biosFilesBySystem["dc"]).containsExactly("dc_boot.bin", "dc_flash.bin")
+
+        // Prose-only entries (no real filename) yield an empty list, not a fake file.
+        assertThat(FolderSpec.biosFilesBySystem["psp"]).isEmpty()
+        assertThat(FolderSpec.biosFilesBySystem["retroarch"]).isEmpty()
+
+        // No extracted "filename" ever contains whitespace or a parenthesis.
+        val bad = FolderSpec.biosFilesBySystem.values.flatten()
+            .filter { it.isBlank() || it.any(Char::isWhitespace) || '(' in it }
+        assertThat(bad).isEmpty()
+    }
+
+    @Test
+    fun `every bios system folder has a matching biosFilesBySystem key`() {
+        val biosSystems = FolderSpec.biosReadmes.keys
+            .map { it.removePrefix("Emulation/bios/").substringBefore('/') }
+            .toSet()
+        assertThat(FolderSpec.biosFilesBySystem.keys).isEqualTo(biosSystems)
+    }
 }

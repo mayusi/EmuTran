@@ -17,8 +17,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.ui.Alignment
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -123,9 +125,9 @@ fun ShizukuScreen(
             )
 
             when (state) {
-                ShizukuAvailability.State.INSTALLED_AND_GRANTED      -> Granted(onContinue = {})
-                ShizukuAvailability.State.INSTALLED_NEEDS_PERMISSION -> NeedsPermission(vm, onContinue = {}, ctx)
-                ShizukuAvailability.State.NOT_RUNNING                -> NotRunning(vm, install, onContinue = {})
+                ShizukuAvailability.State.INSTALLED_AND_GRANTED      -> Granted()
+                ShizukuAvailability.State.INSTALLED_NEEDS_PERMISSION -> NeedsPermission(vm, ctx)
+                ShizukuAvailability.State.NOT_RUNNING                -> NotRunning(vm, install)
             }
 
             // Extra options section, always shown regardless of Shizuku state.
@@ -158,12 +160,27 @@ private fun GpuDriversOptIn(
     val containerColor = if (checked) EmuTones.containerHigh else EmuTones.surface
     val borderColor    = if (checked) Color.White else EmuTones.outlineRest
 
+    // a11y FIX 3: use toggleable instead of clickable so TalkBack announces
+    // the card as a single checkbox node with Role.Checkbox and checked state.
+    // Inner Checkbox is marked decorative via clearAndSetSemantics so there is
+    // only ONE focus stop for TalkBack. Visual and D-pad behaviour are unchanged.
+    //
+    // a11y FIX 5: title now explicitly mentions "Adreno GPUs" so non-Adreno
+    // users understand this option doesn't apply to their device.
+    // FLAG for VM owner: ShizukuViewModel.stageGpuDrivers opt-in could also be
+    // conditionally hidden/disabled when GpuDetector reports non-Adreno GPU.
+    // That requires a new StateFlow in ShizukuViewModel exposing isAdrenoDevice,
+    // which is outside this agent's scope (ViewModel not owned this round).
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .border(BorderStroke(if (checked) 1.dp else 0.5.dp, borderColor), RoundedCornerShape(12.dp))
             .clip(RoundedCornerShape(12.dp))
-            .clickable { onCheckedChange(!checked) },
+            .toggleable(
+                value       = checked,
+                role        = Role.Checkbox,
+                onValueChange = { onCheckedChange(it) },
+            ),
         colors = CardDefaults.cardColors(containerColor = containerColor),
     ) {
         Row(
@@ -172,15 +189,20 @@ private fun GpuDriversOptIn(
                 .padding(horizontal = 16.dp, vertical = 14.dp),
             verticalAlignment = Alignment.Top,
         ) {
-            Checkbox(checked = checked, onCheckedChange = onCheckedChange)
+            // Decorative: the card's toggleable node is the single semantics stop.
+            Checkbox(
+                checked = checked,
+                onCheckedChange = onCheckedChange,
+                modifier = Modifier.clearAndSetSemantics {},
+            )
             Spacer(Modifier.width(12.dp))
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(
-                    text  = "Download GPU drivers (~30 MB, optional)",
+                    text  = "Download Adreno GPU drivers (~30 MB, optional)",
                     style = MaterialTheme.typography.titleMedium,
                 )
                 Text(
-                    text  = "Adds custom Adreno drivers to " +
+                    text  = "Adreno GPUs only. Adds custom Turnip/Adreno drivers to " +
                         "Emulation/tools/turnip/ that you can load in " +
                         "Switch and PS Vita emulators (Eden, Yuzu, " +
                         "Vita3K, Skyline) for better performance.",
@@ -188,8 +210,8 @@ private fun GpuDriversOptIn(
                     color = EmuTones.onSurfaceVar,
                 )
                 Text(
-                    text  = "Leave this off if you only care about " +
-                        "RetroArch, DuckStation, PPSSPP, Dolphin, etc.",
+                    text  = "Leave this off if you have a non-Adreno GPU, or if " +
+                        "you only care about RetroArch, DuckStation, PPSSPP, Dolphin, etc.",
                     style = MaterialTheme.typography.bodySmall,
                     color = EmuTones.onSurfaceVar,
                 )
@@ -199,7 +221,7 @@ private fun GpuDriversOptIn(
 }
 
 @Composable
-private fun Granted(onContinue: () -> Unit) {
+private fun Granted() {
     Text(
         text  = "Shizuku is set up — installs will run silently.",
         style = MaterialTheme.typography.titleMedium,
@@ -215,7 +237,6 @@ private fun Granted(onContinue: () -> Unit) {
 @Composable
 private fun NeedsPermission(
     vm: ShizukuViewModel,
-    onContinue: () -> Unit,
     ctx: android.content.Context,
 ) {
     Text(
@@ -243,7 +264,6 @@ private fun NeedsPermission(
 private fun NotRunning(
     vm: ShizukuViewModel,
     install: ShizukuViewModel.InstallFlow,
-    onContinue: () -> Unit,
 ) {
     Text(
         text  = "Shizuku not detected.",

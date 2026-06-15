@@ -229,11 +229,30 @@ class HtmlScrapeSource @Inject constructor(
         )
     }
 
-    /** HTTP fetcher with browser-ish UA so sites that 403 on java UAs work. */
+    /**
+     * HTTP fetcher with a browser-ish UA so sites that 403 on java UAs work.
+     *
+     * Per-host UA override: some hosts respond 200 to Obtainium's own UA but
+     * 403 to a browser UA (or vice-versa). [HOST_UA_OVERRIDES] maps a host
+     * substring to the UA string to send for that host. If no override matches,
+     * [BROWSER_UA] is used.
+     *
+     * Currently overridden hosts:
+     *  - dolphin-emu.org: returns 403 to browser UAs but 200 to "Obtainium/1.0".
+     *    Their nginx config was deliberately configured this way. Sending the
+     *    Obtainium UA restores access and the DOLPHIN_APK_URL_REGEX then extracts
+     *    the CDN .apk URL from the page's inlined JSON.
+     */
     private suspend fun fetchHtml(url: String): String? = withContext(Dispatchers.IO) {
+        val host = runCatching { java.net.URI(url).host?.lowercase().orEmpty() }.getOrDefault("")
+        val ua = HOST_UA_OVERRIDES.entries
+            .firstOrNull { (hostSubstring, _) -> hostSubstring in host }
+            ?.value
+            ?: BROWSER_UA
+
         val req = Request.Builder()
             .url(url)
-            .header("User-Agent", BROWSER_UA)
+            .header("User-Agent", ua)
             .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
             .header("Accept-Language", "en-US,en;q=0.9")
             .build()
@@ -274,7 +293,7 @@ class HtmlScrapeSource @Inject constructor(
         link.startsWith("http://") || link.startsWith("https://") -> link
         link.startsWith("//") -> "https:$link"
         link.startsWith("/") -> {
-            val origin = Regex("""^(https?://[^/]+)""").find(baseUrl)?.value ?: baseUrl
+            val origin = ORIGIN_REGEX.find(baseUrl)?.value ?: baseUrl
             "$origin$link"
         }
         else -> {
@@ -284,10 +303,30 @@ class HtmlScrapeSource @Inject constructor(
     }
 
     companion object {
+        /** Extracts the scheme+host origin from a base URL (for root-relative hrefs). */
+        private val ORIGIN_REGEX = Regex("""^(https?://[^/]+)""")
+
         /** Chrome on Android UA. Boring & widely accepted. */
         private const val BROWSER_UA =
             "Mozilla/5.0 (Linux; Android 13; Odin3) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+
+        /**
+         * Per-host User-Agent overrides.
+         *
+         * Some download servers allow or block specific UAs at the nginx/CDN
+         * level. For those hosts we send a targeted UA instead of [BROWSER_UA].
+         *
+         * Maps host substring → UA string. The first matching entry wins.
+         *
+         * dolphin-emu.org: Their nginx config returns 403 to browser UAs but
+         * serves the download page (including inlined APK JSON) correctly when
+         * the UA is "Obtainium/1.0". Do NOT change this to BROWSER_UA — it
+         * will break Dolphin downloads for all users.
+         */
+        private val HOST_UA_OVERRIDES: Map<String, String> = mapOf(
+            "dolphin-emu.org" to "Obtainium/1.0",
+        )
 
         /** Any href/src ending in .apk (with optional query string). */
         private val APK_LINK_REGEX =

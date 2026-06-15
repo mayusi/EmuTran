@@ -3,15 +3,14 @@ package io.github.mayusi.emutran.domain.download
 import android.content.Context
 import dagger.hilt.android.qualifiers.ApplicationContext
 import io.github.mayusi.emutran.data.source.ApkAssetFilter
+import io.github.mayusi.emutran.data.source.HttpsDowngradeInterceptor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
-import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.Response
 import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
@@ -255,7 +254,15 @@ class ApkDownloader @Inject constructor(
         expectedSha256: String?,
     ) {
         if (expectedSha256 != null) {
-            val actual = sha256Hex(file)
+            // Fix 5: catch IOException so a file-read failure emits Failed
+            // rather than escaping the flow and crashing the coroutine.
+            val actual = try {
+                sha256Hex(file)
+            } catch (e: IOException) {
+                file.delete()
+                emit(Progress.Failed("Checksum read failed: ${e.message}"))
+                return
+            }
             if (!actual.equals(expectedSha256, ignoreCase = true)) {
                 file.delete()
                 emit(Progress.Failed(
@@ -267,7 +274,15 @@ class ApkDownloader @Inject constructor(
         emit(Progress.Done(file))
     }
 
-    /** Computes the lowercase hex SHA-256 digest of [file]. */
+    /**
+     * Computes the lowercase hex SHA-256 digest of [file].
+     *
+     * Throws are NOT caught here; callers must wrap in try/catch(IOException)
+     * or use [verifyAndEmitDone] which does so.
+     *
+     * Fix 5: [verifyAndEmitDone] now catches IOException from this method
+     * and emits [Progress.Failed] rather than letting it escape the flow.
+     */
     private fun sha256Hex(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
         file.inputStream().use { input ->
@@ -286,59 +301,5 @@ class ApkDownloader @Inject constructor(
         data class Chunk(val downloaded: Long, val totalBytes: Long) : Progress
         data class Done(val file: File) : Progress
         data class Failed(val message: String) : Progress
-    }
-}
-
-/**
- * FIX 3 (HTTPS downgrade protection): Network interceptor that rejects any
- * 3xx redirect that downgrades from HTTPS to HTTP.
- *
- * Rationale: The shared OkHttpClient has followSslRedirects(true), which
- * permits GitHub or Gitea to silently redirect an HTTPS APK download to
- * a plain HTTP URL — exposing the downloaded bytes to MITM substitution.
- * We scope this protection to APK downloads via ApkDownloader's private
- * downloadClient, without touching the shared client used by other
- * data-layer components.
- *
- * What this does:
- *   - On a 3xx response, checks the Location header.
- *   - If the original request URL was https:// and Location is http://,
- *     throws IOException("HTTPS→HTTP redirect blocked") so the download
- *     loop treats it as a transient error (will retry / eventually fail
- *     with a clear message rather than silently installing an unverified APK).
- *
- * What this does NOT block:
- *   - Requests that originate as http:// (ppsspp.org) — their cleartext
- *     is explicitly permitted in network_security_config.xml and there is
- *     no downgrade happening (they were always HTTP).
- *   - HTTPS→HTTPS redirects (CDN hops, www→non-www, etc.) — those are fine.
- *   - Non-redirect responses — interceptor is a no-op for 2xx/4xx/5xx.
- *
- * Tradeoff: We throw on the first 3xx we see that downgrades, which means
- * the retry loop does attempt again (up to MAX_ATTEMPTS times). A future
- * improvement could add "permanent failure" detection, but the current
- * behaviour is safe — a downgrading redirect is not going to un-downgrade
- * on retry, so exhausting retries and emitting Failed is the right outcome.
- */
-private class HttpsDowngradeInterceptor : Interceptor {
-    override fun intercept(chain: Interceptor.Chain): Response {
-        val request = chain.request()
-        val response = chain.proceed(request)
-
-        // Only inspect redirects.
-        if (response.code in 300..399) {
-            val location = response.header("Location") ?: return response
-            val isHttpsOrigin = request.url.scheme.equals("https", ignoreCase = true)
-            val isHttpDestination = location.startsWith("http://", ignoreCase = true)
-            if (isHttpsOrigin && isHttpDestination) {
-                response.close()
-                throw IOException(
-                    "HTTPS→HTTP redirect blocked (${request.url.host} → $location). " +
-                        "This may indicate a MITM attack or server misconfiguration. " +
-                        "APK download aborted for safety."
-                )
-            }
-        }
-        return response
     }
 }

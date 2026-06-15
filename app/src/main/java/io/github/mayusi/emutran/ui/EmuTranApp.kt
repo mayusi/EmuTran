@@ -14,6 +14,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -30,10 +31,10 @@ import io.github.mayusi.emutran.ui.permissions.PermissionsScreen
 import io.github.mayusi.emutran.ui.pickapps.PickAppsScreen
 import io.github.mayusi.emutran.ui.pickapps.QuickSetupViewModel
 import io.github.mayusi.emutran.ui.pickfolder.PickFolderScreen
+import io.github.mayusi.emutran.ui.profile.ProfileScreen
 import io.github.mayusi.emutran.ui.progress.ProgressScreen
 import io.github.mayusi.emutran.ui.shizuku.ShizukuScreen
 import io.github.mayusi.emutran.ui.splash.SplashScreen
-import io.github.mayusi.emutran.ui.testinstall.TestInstallScreen
 
 /**
  * Top-level navigation graph.
@@ -62,11 +63,15 @@ object Routes {
     const val PROGRESS = "progress"
     const val DONE = "done"
     const val DASHBOARD = "dashboard"
-    const val TEST_INSTALL = "test_install" // dev-only, hidden in release
     const val ABOUT = "about"
     const val HEALTH = "health"
+    const val PROFILE = "profile"
 }
 
+// The top-level Scaffold intentionally ignores its content padding: each NavHost
+// destination owns its own insets (via systemBarsPadding / its own Scaffold), so
+// the outer padding is deliberately unused here.
+@Suppress("UnusedMaterial3ScaffoldPaddingParameter")
 @Composable
 fun EmuTranApp(
     bootstrap: AppBootstrapViewModel = hiltViewModel(),
@@ -92,7 +97,7 @@ fun EmuTranApp(
         // FIX 4: track whether the last completed setup run was fully successful.
         // ProgressScreen's onDone callback sets this before navigating to DONE,
         // so DoneScreen can show celebratory vs neutral UI accordingly.
-        var lastSetupSuccess by remember { mutableStateOf(true) }
+        var lastSetupSuccess by rememberSaveable { mutableStateOf(true) }
 
         // FIX 7: snackbar host for QuickSetup failure messages.
         val snackbarHostState = remember { SnackbarHostState() }
@@ -153,7 +158,6 @@ fun EmuTranApp(
                                 popUpTo(Routes.SPLASH) { inclusive = true }
                             }
                         },
-                        onTestInstall = { navController.navigate(Routes.TEST_INSTALL) },
                     )
                 }
                 composable(Routes.DASHBOARD) {
@@ -201,16 +205,32 @@ fun EmuTranApp(
                         onHealthCheck = {
                             navController.navigate(Routes.HEALTH)
                         },
+                        onProfile = {
+                            navController.navigate(Routes.PROFILE)
+                        },
                     )
-                }
-                composable(Routes.TEST_INSTALL) {
-                    TestInstallScreen()
                 }
                 composable(Routes.ABOUT) {
                     AboutScreen(onBack = { navController.popBackStack() })
                 }
                 composable(Routes.HEALTH) {
                     HealthCheckScreen(onBack = { navController.popBackStack() })
+                }
+                composable(Routes.PROFILE) {
+                    ProfileScreen(
+                        onBack = { navController.popBackStack() },
+                        onImported = { toProgress ->
+                            if (toProgress) {
+                                // Run the just-restored setup. Drop PROFILE off the
+                                // back stack so Back from PROGRESS won't re-enter it.
+                                navController.navigate(Routes.PROGRESS) {
+                                    popUpTo(Routes.PROFILE) { inclusive = true }
+                                }
+                            } else {
+                                navController.popBackStack()
+                            }
+                        },
+                    )
                 }
             }
         }

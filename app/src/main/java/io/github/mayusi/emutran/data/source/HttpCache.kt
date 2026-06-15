@@ -38,8 +38,8 @@ private val Context.httpCacheStore by preferencesDataStore(name = "emutran_http_
 @Singleton
 class HttpCache @Inject constructor(
     @ApplicationContext private val context: Context,
+    private val json: Json,
 ) {
-    private val json = Json { ignoreUnknownKeys = true }
     private val memCache = ConcurrentHashMap<String, Entry>()
 
     @Serializable
