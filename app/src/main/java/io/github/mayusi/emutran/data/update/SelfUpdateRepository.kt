@@ -1,9 +1,7 @@
 package io.github.mayusi.emutran.data.update
 
+import android.content.ActivityNotFoundException
 import android.content.Context
-import android.content.Intent
-import android.net.Uri
-import androidx.core.content.FileProvider
 import dagger.hilt.android.qualifiers.ApplicationContext
 import io.github.mayusi.emutran.BuildConfig
 import io.github.mayusi.emutran.data.source.GhAsset
@@ -11,7 +9,9 @@ import io.github.mayusi.emutran.data.source.GhRelease
 import io.github.mayusi.emutran.data.source.HttpCache
 import io.github.mayusi.emutran.data.source.parseSha256SidecarBody
 import io.github.mayusi.emutran.domain.download.ApkDownloader
+import io.github.mayusi.emutran.domain.install.IntentInstaller
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
@@ -20,7 +20,6 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import java.io.File
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -66,6 +65,7 @@ class SelfUpdateRepository @Inject constructor(
     private val downloader: ApkDownloader,
     private val store: UpdateStateStore,
     private val json: Json,
+    private val intentInstaller: IntentInstaller,
 ) {
 
     // ── Public API ──────────────────────────────────────────────────────────
@@ -135,36 +135,63 @@ class SelfUpdateRepository @Inject constructor(
         }
 
     /**
-     * Download the self-update APK from [apkUrl] and launch the system
-     * installer via ACTION_VIEW. The running app process is replaced by
-     * the installer session — Shizuku silent install is intentionally not
-     * used here because silently replacing the running host process is
-     * unreliable and can leave the device in a bad state.
+     * Download the self-update APK from [apkUrl] and hand it to the system
+     * installer via [IntentInstaller.install] (ACTION_VIEW + FileProvider).
+     * The running app process is replaced by the installer session — Shizuku
+     * silent install is intentionally not used here because silently replacing
+     * the running host process is unreliable and can leave the device in a bad
+     * state.
      *
-     * Emits the same [ApkDownloader.Progress] events as the emulator
-     * update flow so the UI can show a shared progress sheet.
+     * Emits [SelfUpdateProgress] events so the UI can show a shared progress
+     * sheet. The [ApkDownloader.Progress] events from the underlying download
+     * are mapped to the matching [SelfUpdateProgress] variants.
      *
-     * On [ApkDownloader.Progress.Done] the file is handed to the system
-     * installer and the flow completes. The user will see the standard
-     * "Install / Cancel" dialog.
+     * == Install-permission gate (DEFECT 1) ==
      *
-     * If [sha256Url] is non-null the sidecar is fetched first and the hex
-     * hash is passed to the downloader. On checksum mismatch the downloader
-     * emits [ApkDownloader.Progress.Failed] — the installer is NOT launched.
+     * On Android 8+ the system installer silently no-ops if this app lacks the
+     * per-app "Install unknown apps" grant. Before launching, we check
+     * [IntentInstaller.canRequestInstalls]; if it returns false we emit
+     * [SelfUpdateProgress.NeedsInstallPermission] (a distinct state) instead of
+     * silently failing. The UI then deep-links the user to the settings page
+     * via [openInstallPermissionSettings] and asks them to enable it and retry.
+     * The downloaded APK is preserved so the retry resumes from cache.
+     *
+     * The [IntentInstaller.install] call is wrapped in try/catch: an
+     * [ActivityNotFoundException] or [SecurityException] surfaces as
+     * [SelfUpdateProgress.Failed] rather than crashing the flow.
+     *
+     * == SHA-256 sidecar verification (DEFECT 2) ==
+     *
+     * If [sha256Url] is non-null the sidecar is fetched first (with a few
+     * retries — see [fetchSidecarHash]) and the hex hash is passed to the
+     * downloader. On checksum mismatch the downloader emits
+     * [ApkDownloader.Progress.Failed] — the installer is NOT launched. When a
+     * sidecar URL is present but ALL retries fail, we ABORT (a single transient
+     * blip no longer kills the update, but a definitively-unreachable sidecar
+     * still blocks the install — MITM protection).
      *
      * This flow is cancellation-cooperative: if the collecting coroutine is
-     * cancelled before [ApkDownloader.Progress.Done] is received, the
-     * [launchInstaller] call is never reached. The caller (AboutViewModel)
-     * cancels this coroutine from [dismissSheet] so mid-download dismissal
-     * is safe.
+     * cancelled before [ApkDownloader.Progress.Done] is received, the install
+     * hand-off is never reached. The caller (AboutViewModel) cancels this
+     * coroutine from [dismissSheet] so mid-download dismissal is safe.
      *
      * After the installer is launched, [UpdateStateStore.setSelfCheckEpoch]
      * is reset to 0 so the 24h gate doesn't suppress the next check after
      * the update is applied.
      */
-    fun downloadAndInstall(apkUrl: String, sha256Url: String? = null): Flow<ApkDownloader.Progress> = flow {
+    fun downloadAndInstall(apkUrl: String, sha256Url: String? = null): Flow<SelfUpdateProgress> = flow {
         val filename = apkUrl.substringAfterLast('/').takeIf { it.isNotBlank() }
             ?: "emutran-update.apk"
+
+        // DEFECT 1 (install-permission gate): bail early — before downloading —
+        // if the OS won't let us install. Emitting a distinct state lets the UI
+        // deep-link the user to the "Install unknown apps" settings page instead
+        // of pulling the APK and then silently no-op'ing the installer.
+        if (!intentInstaller.canRequestInstalls()) {
+            android.util.Log.w(TAG, "Install-unknown-apps permission not granted; prompting user")
+            emit(SelfUpdateProgress.NeedsInstallPermission)
+            return@flow
+        }
 
         // Resolve expected SHA-256 from the sidecar file if a URL was provided.
         // The sidecar contains either just the 64-hex-char hash or a sha256sum
@@ -174,15 +201,21 @@ class SelfUpdateRepository @Inject constructor(
         // Proceeding without verification when a sidecar was expected would allow a
         // targeted MITM that 404s the sidecar to bypass integrity checks. Only when
         // sha256Url is null (release publishes no sidecar) do we skip verification.
+        //
+        // DEFECT 2 (resilient fetch): fetchSidecarHash now retries a few times with
+        // backoff, so a single transient non-2xx blip no longer aborts the whole
+        // update. Abort only happens after ALL retries genuinely fail.
         val expectedSha256: String? = if (sha256Url != null) {
             val hash = fetchSidecarHash(sha256Url)
             if (hash == null) {
                 android.util.Log.e(
                     TAG,
-                    "SHA-256 sidecar fetch failed for $sha256Url; aborting update for safety"
+                    "SHA-256 sidecar fetch failed for $sha256Url after $SIDECAR_FETCH_ATTEMPTS " +
+                        "attempts; aborting update for safety"
                 )
-                emit(ApkDownloader.Progress.Failed(
-                    "SHA-256 sidecar fetch failed; update aborted for safety"
+                emit(SelfUpdateProgress.Failed(
+                    "SHA-256 sidecar unreachable after $SIDECAR_FETCH_ATTEMPTS attempts; " +
+                        "update aborted for safety"
                 ))
                 return@flow
             }
@@ -198,18 +231,48 @@ class SelfUpdateRepository @Inject constructor(
             filename = filename,
             expectedSha256 = expectedSha256,
         ).collect { progress ->
-            emit(progress)
-            if (progress is ApkDownloader.Progress.Done) {
-                // Invalidate the 24h gate so the next launch-time check is fresh
-                // and won't re-offer a version the user is currently installing.
-                store.setSelfCheckEpoch(0L)
-                launchInstaller(progress.file)
+            when (progress) {
+                is ApkDownloader.Progress.Started ->
+                    emit(SelfUpdateProgress.Started(progress.totalBytes))
+                is ApkDownloader.Progress.Chunk ->
+                    emit(SelfUpdateProgress.Chunk(progress.downloaded, progress.totalBytes))
+                is ApkDownloader.Progress.Failed ->
+                    // Checksum mismatch or network failure from the downloader —
+                    // the installer is NOT launched (Done branch never reached).
+                    emit(SelfUpdateProgress.Failed(progress.message))
+                is ApkDownloader.Progress.Done -> {
+                    // Invalidate the 24h gate so the next launch-time check is fresh
+                    // and won't re-offer a version the user is currently installing.
+                    store.setSelfCheckEpoch(0L)
+                    // DEFECT 1: wrap the install hand-off so a missing installer
+                    // activity or a revoked permission surfaces as Failed instead
+                    // of crashing the collecting coroutine.
+                    try {
+                        intentInstaller.install(progress.file)
+                        emit(SelfUpdateProgress.Done)
+                    } catch (e: ActivityNotFoundException) {
+                        android.util.Log.e(TAG, "No installer activity for self-update", e)
+                        emit(SelfUpdateProgress.Failed(
+                            "Couldn't open the system installer on this device"
+                        ))
+                    } catch (e: SecurityException) {
+                        android.util.Log.e(TAG, "Installer denied for self-update", e)
+                        emit(SelfUpdateProgress.NeedsInstallPermission)
+                    }
+                }
             }
-            // Progress.Failed is emitted by the downloader (checksum mismatch
-            // or network failure) — we re-emit it above and do NOT launch the
-            // installer because the Done branch is never reached.
         }
     }.flowOn(Dispatchers.IO)
+
+    /**
+     * Deep-link the user to the per-app "Install unknown apps" settings page so
+     * they can grant the permission that [SelfUpdateProgress.NeedsInstallPermission]
+     * told the UI was missing. After granting it the user re-taps "Update now"
+     * and the download resumes from cache.
+     */
+    fun openInstallPermissionSettings() {
+        intentInstaller.openManageUnknownAppsSettings()
+    }
 
     /**
      * Returns the self-update status suitable for a launch-time dashboard banner.
@@ -319,48 +382,62 @@ class SelfUpdateRepository @Inject constructor(
     }
 
     /**
-     * Fetches the sidecar .sha256 file at [url] and extracts the 64-hex-char
-     * hash token. Handles both:
-     *   - Bare hex:                    "abc123...def"
-     *   - sha256sum format:            "abc123...def  filename.apk"
+     * Fetches the sidecar .sha256 file at [url] and delegates body parsing to
+     * [parseSha256SidecarBody] (shared with AppSourceRouter so parsing logic is
+     * not duplicated). Returns the lowercase hash string, or null if the fetch
+     * or parse definitively fails.
      *
-     * Returns the lowercase hash string, or null if the fetch or parse fails.
-     * Failures are non-fatal: the download continues without verification.
+     * DEFECT 2 (resilient fetch): the GET is retried up to [SIDECAR_FETCH_ATTEMPTS]
+     * times with a short exponential backoff before giving up. This distinguishes
+     * a single transient blip (a non-2xx / IO error on one attempt, which a retry
+     * recovers from) from a sidecar that is genuinely unreachable (every attempt
+     * fails → return null → caller ABORTS for MITM safety). The success path is
+     * unchanged: as soon as a 2xx body parses to a hash we return it immediately.
      */
-    /**
-     * Fetches the sidecar .sha256 file at [url] and delegates body parsing
-     * to [parseSha256SidecarBody] (shared with AppSourceRouter so parsing
-     * logic is not duplicated). Returns null if the fetch or parse fails.
-     */
-    private fun fetchSidecarHash(url: String): String? {
-        return try {
-            val request = Request.Builder().url(url).build()
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return null
-                val text = response.body?.string() ?: return null
-                parseSha256SidecarBody(text)
+    private suspend fun fetchSidecarHash(url: String): String? {
+        var lastReason = "unknown"
+        for (attempt in 1..SIDECAR_FETCH_ATTEMPTS) {
+            // One attempt: returns the parsed hash on success, or null on a
+            // (possibly transient) failure with [lastReason] set for logging.
+            val hash: String? = try {
+                val request = Request.Builder().url(url).build()
+                client.newCall(request).execute().use { response ->
+                    when {
+                        !response.isSuccessful -> {
+                            lastReason = "HTTP ${response.code}"; null
+                        }
+                        else -> {
+                            val text = response.body?.string()
+                            if (text == null) {
+                                lastReason = "empty body"; null
+                            } else {
+                                parseSha256SidecarBody(text)
+                                    ?: run { lastReason = "unparseable body"; null }
+                            }
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                lastReason = t.message ?: t.javaClass.simpleName
+                null
             }
-        } catch (t: Throwable) {
-            android.util.Log.w(TAG, "Failed to fetch SHA-256 sidecar: ${t.message}")
-            null
-        }
-    }
 
-    /**
-     * Launch the system installer via ACTION_VIEW for [apk].
-     * Uses the shared FileProvider authority (apks/ cache path exposed in file_paths.xml).
-     */
-    private fun launchInstaller(apk: File) {
-        val authority = "${context.packageName}.fileprovider"
-        val uri: Uri = FileProvider.getUriForFile(context, authority, apk)
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "application/vnd.android.package-archive")
-            addFlags(
-                Intent.FLAG_ACTIVITY_NEW_TASK or
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION
-            )
+            if (hash != null) return hash
+
+            if (attempt < SIDECAR_FETCH_ATTEMPTS) {
+                android.util.Log.w(
+                    TAG,
+                    "SHA-256 sidecar fetch attempt $attempt/$SIDECAR_FETCH_ATTEMPTS failed " +
+                        "($lastReason); retrying"
+                )
+                delay(SIDECAR_RETRY_BASE_DELAY_MS * (1L shl (attempt - 1))) // 300ms, 600ms…
+            }
         }
-        context.startActivity(intent)
+        android.util.Log.w(
+            TAG,
+            "SHA-256 sidecar fetch exhausted $SIDECAR_FETCH_ATTEMPTS attempts ($lastReason)"
+        )
+        return null
     }
 
     // GhRelease and GhAsset are defined in GithubDtos.kt (shared with
@@ -374,8 +451,52 @@ class SelfUpdateRepository @Inject constructor(
         /** Minimum gap between self-update checks: 24 hours. */
         const val SELF_CHECK_INTERVAL_MS: Long = 24 * 60 * 60 * 1_000L
 
+        /**
+         * DEFECT 2: total attempts to fetch the SHA-256 sidecar before aborting.
+         * One initial try + 2 retries. A single transient blip recovers; a
+         * genuinely-unreachable sidecar still aborts the update (MITM safety).
+         */
+        const val SIDECAR_FETCH_ATTEMPTS: Int = 3
+
+        /** Base backoff between sidecar fetch retries (doubles each attempt). */
+        private const val SIDECAR_RETRY_BASE_DELAY_MS: Long = 300L
+
         private const val TAG = "SelfUpdateRepository"
     }
+}
+
+// ── Self-update install progress ──────────────────────────────────────────────
+
+/**
+ * Progress events for [SelfUpdateRepository.downloadAndInstall].
+ *
+ * Mirrors the relevant [ApkDownloader.Progress] variants ([Started], [Chunk],
+ * [Done], [Failed]) but adds [NeedsInstallPermission] (DEFECT 1) so the UI can
+ * distinguish "the OS won't let us install yet — send the user to settings" from
+ * a generic failure. UI agents switch on this to drive the self-update sheet.
+ */
+sealed interface SelfUpdateProgress {
+    /** Download started; [totalBytes] is the content length (may be 0 if unknown). */
+    data class Started(val totalBytes: Long) : SelfUpdateProgress
+
+    /** A chunk landed; [downloaded] of [totalBytes] bytes written so far. */
+    data class Chunk(val downloaded: Long, val totalBytes: Long) : SelfUpdateProgress
+
+    /** APK downloaded (and checksum-verified if a sidecar was present) and the
+     *  system installer was launched successfully. */
+    data object Done : SelfUpdateProgress
+
+    /**
+     * DEFECT 1: the app lacks the per-app "Install unknown apps" grant (Android 8+),
+     * so the installer would silently no-op. The UI should show a message and an
+     * action that calls [SelfUpdateRepository.openInstallPermissionSettings], then
+     * let the user retry once they've enabled it.
+     */
+    data object NeedsInstallPermission : SelfUpdateProgress
+
+    /** Download, checksum, sidecar, or installer-launch failure. [message] is
+     *  suitable for a Snackbar. */
+    data class Failed(val message: String) : SelfUpdateProgress
 }
 
 // ── Public result types ─────────────────────────────────────────────────────
@@ -410,25 +531,5 @@ sealed interface SelfUpdateResult {
     data class Failed(val reason: String) : SelfUpdateResult
 }
 
-/**
- * Minimal semver parser: strips leading 'v', then splits on '.' and
- * compares major.minor.patch numerically. Non-numeric or missing components
- * default to 0. Sufficient for EmuTran's "v0.x.y" release tags.
- */
-internal data class SemVer(val major: Int, val minor: Int, val patch: Int) :
-    Comparable<SemVer> {
-    override fun compareTo(other: SemVer): Int =
-        compareValuesBy(this, other, { it.major }, { it.minor }, { it.patch })
-
-    companion object {
-        fun parse(raw: String): SemVer {
-            val clean = raw.trimStart('v', 'V')
-            val parts = clean.split('.').mapNotNull { it.toIntOrNull() }
-            return SemVer(
-                major = parts.getOrElse(0) { 0 },
-                minor = parts.getOrElse(1) { 0 },
-                patch = parts.getOrElse(2) { 0 },
-            )
-        }
-    }
-}
+// SemVer now lives in its own file (data/update/SemVer.kt) so it can be shared
+// with UpdateRepository's emulator update check. Same package → no import needed.

@@ -19,6 +19,7 @@ import io.github.mayusi.emutran.data.source.AssetKind
 import io.github.mayusi.emutran.data.source.ResolveResult
 import io.github.mayusi.emutran.data.storage.SetupOptionsStore
 import io.github.mayusi.emutran.data.storage.StorageRootStore
+import io.github.mayusi.emutran.data.update.SelfUpdateProgress
 import io.github.mayusi.emutran.data.update.SelfUpdateRepository
 import io.github.mayusi.emutran.data.update.SelfUpdateResult
 import io.github.mayusi.emutran.data.update.UpdateInfo
@@ -295,9 +296,9 @@ class DashboardViewModel @Inject constructor(
                 var lastEmitMs = 0L
                 selfUpdateRepository.downloadAndInstall(apkUrl, sha256Url).collect { progress ->
                     when (progress) {
-                        is ApkDownloader.Progress.Started ->
+                        is SelfUpdateProgress.Started ->
                             _selfUpdateSheet.value = SelfUpdateSheetUiState.Downloading(0, version)
-                        is ApkDownloader.Progress.Chunk -> {
+                        is SelfUpdateProgress.Chunk -> {
                             // FIX 4 throttle: emit at most once per 200ms.
                             val now = System.currentTimeMillis()
                             if (now - lastEmitMs >= DOWNLOAD_EMIT_THROTTLE_MS) {
@@ -308,11 +309,25 @@ class DashboardViewModel @Inject constructor(
                                 _selfUpdateSheet.value = SelfUpdateSheetUiState.Downloading(pct, version)
                             }
                         }
-                        is ApkDownloader.Progress.Done -> {
+                        is SelfUpdateProgress.Done -> {
                             _selfUpdateSheet.value = null
                             _selfUpdate.value = null
                         }
-                        is ApkDownloader.Progress.Failed ->
+                        // DEFECT 1: the OS blocked the install because "Install unknown
+                        // apps" is off for EmuTran. The dashboard surfaces user messages
+                        // through a plain-string snackbar (the screen collects
+                        // [userMessage]), so we both tell the user what's wrong AND
+                        // deep-link them straight to the settings page. The sheet is
+                        // closed; after granting they re-open it and tap "Update now".
+                        is SelfUpdateProgress.NeedsInstallPermission -> {
+                            _selfUpdateSheet.value = null
+                            _userMessage.emit(
+                                "Allow EmuTran to install apps in the settings page that " +
+                                    "just opened, then tap Update again."
+                            )
+                            selfUpdateRepository.openInstallPermissionSettings()
+                        }
+                        is SelfUpdateProgress.Failed ->
                             _userMessage.emit("Update failed: ${progress.message}")
                     }
                 }

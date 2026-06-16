@@ -36,16 +36,19 @@ import javax.inject.Singleton
  * == Version comparison ==
  *
  * [AppSourceRouter.resolve] returns a version *string* (tag name from the
- * GitHub / Gitea API — e.g. "v1.14.0", "2024.12.01", "r3645"). We can't
- * reliably turn every release tag into a numeric version code, so we use
- * string inequality: if the latest tag ≠ the tag we stored at the last
- * install time, we flag it as a potential update. This errs toward
- * showing a badge rather than silently missing one.
+ * GitHub / Gitea API — e.g. "v1.14.0", "1.19.1-arm64-v8a", "unknown") while
+ * PackageManager reports the installed [PackageInfo.versionName] (e.g.
+ * "1.19.1", "5.0-21449"). These two namespaces rarely match character-for-
+ * character, so a raw string compare badged nearly every installed emulator
+ * permanently. Instead [computeHasUpdate] parses both sides into [SemVer]
+ * (lenient to arch/build suffixes) and badges ONLY when the available version
+ * is strictly greater. When either side is a date tag, "unknown", a git hash,
+ * or otherwise unparseable, the result is treated as indeterminate and NO
+ * badge is shown — a missed update is far better UX than a permanent false one.
  *
- * For the initial installed version we read [PackageInfo.longVersionCode]
- * (and fall back to [PackageInfo.versionName]) from PackageManager so we
- * have *something* to show in the UI. The version we compare against is
- * always the latest string from the source.
+ * For the installed version we read [PackageInfo.longVersionCode] (and
+ * [PackageInfo.versionName]) from PackageManager so we have something to show
+ * in the UI; the SemVer compare runs against the latest string from the source.
  *
  * == Rate limiting ==
  *
@@ -299,7 +302,14 @@ class UpdateRepository @Inject constructor(
                                 ?: currentInfo.installedVersionCode,
                             installedVersionName = freshPkgInfo?.versionName
                                 ?: currentInfo.installedVersionName,
-                            // Keep availableVersion so UI can show "up to date" label
+                            // FIX (re-baseline): re-stamp availableVersion to the tag we
+                            // just installed. The PM versionName and the source tag live in
+                            // different namespaces (e.g. "1.19.1" vs "1.19.1-arm64-v8a"), so
+                            // leaving availableVersion at the old resolved tag could keep the
+                            // badge lit even though we are now current. Setting both sides to
+                            // the just-installed resolved version guarantees computeHasUpdate
+                            // returns false until the NEXT check finds something genuinely newer.
+                            availableVersion = resolved.version,
                         )
                     )
                 }
@@ -364,7 +374,13 @@ class UpdateRepository @Inject constructor(
                 pm.getInstalledPackages(0)
             }
             list.filter { it.packageName in packageNames }.associateBy { it.packageName }
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            // DEFECT 4 (silent-zero): a PM bulk-query failure here used to vanish
+            // every badge silently (all versionCodes fall to -1). Log it so the
+            // failure is at least diagnosable; we still return emptyMap because a
+            // partial result isn't available and over-engineering a retry here is
+            // out of scope.
+            android.util.Log.w(TAG, "PM bulk query failed; update badges suppressed this cycle", t)
             emptyMap()
         }
     }
@@ -387,14 +403,50 @@ class UpdateRepository @Inject constructor(
     }
 
     /**
-     * Returns true when the source reported a version that is different from
-     * the last version we recorded as installed.
+     * Returns true ONLY when we are confident a strictly-newer version is
+     * available — a deliberately conservative bias.
+     *
+     * The old implementation compared the source's git TAG (e.g.
+     * "1.19.1-arm64-v8a", "unknown", "2025-01-15", "v2120") against the
+     * Android PM versionName (e.g. "1.19.1", "5.0-21449") with raw string
+     * inequality. Those namespaces almost never match, so nearly every
+     * installed emulator showed a permanent false "Update" badge that never
+     * cleared. See the root-cause note in the repo header.
+     *
+     * New rule (like-for-like, confidence-biased):
+     *   - Not installed (versionCode < 0) or not yet checked (available null)
+     *     → false.
+     *   - If EITHER side is a date-style tag, "unknown", a git hash, or
+     *     otherwise has no leading numeric version run → indeterminate → false.
+     *     A missed update is far better UX than a permanent false one.
+     *   - If BOTH parse to a [SemVer] → true iff available is STRICTLY greater.
+     *     Equal versions and downgrades → false (no badge).
      */
     internal fun computeHasUpdate(info: UpdateStateStore.PersistedUpdateInfo): Boolean {
         if (info.installedVersionCode < 0) return false       // not installed
         val available = info.availableVersion ?: return false  // not yet checked
-        return available.trimStart('v', 'V') != info.installedVersionName.trimStart('v', 'V')
+        val installed = info.installedVersionName
+
+        // Date-style tags ("2025.01.15", "2024-12-01") start with digits and
+        // would otherwise parse to a numeric SemVer and mis-compare. Treat them
+        // as indeterminate on either side → no badge.
+        if (looksLikeDate(available) || looksLikeDate(installed)) return false
+
+        val availableSemVer = SemVer.parseOrNull(available) ?: return false
+        val installedSemVer = SemVer.parseOrNull(installed) ?: return false
+
+        return availableSemVer > installedSemVer
     }
+
+    /**
+     * Heuristic: does this tag look like a calendar version rather than a
+     * semantic version? Matches a 4-digit year followed by month/day parts
+     * separated by '.' or '-' (e.g. "2024.12.01", "2025-01-15"). Used to keep
+     * date-style emulator tags out of the SemVer comparison so they never
+     * produce a false update badge.
+     */
+    private fun looksLikeDate(raw: String): Boolean =
+        DATE_TAG_REGEX.matches(raw.trim())
 
     companion object {
         /** Minimum age between automatic checks for a single entry: 6 hours. */
@@ -404,6 +456,16 @@ class UpdateRepository @Inject constructor(
          * Maximum simultaneous source API calls.
          */
         private const val MAX_CONCURRENT_RESOLVES = 4
+
+        private const val TAG = "UpdateRepository"
+
+        /**
+         * Calendar-version tag: 4-digit year + 2 numeric parts separated by
+         * '.' or '-' (e.g. "2024.12.01", "2025-01-15"). Anchored on a 4-digit
+         * lead so it never matches "5.0-21449" (Dolphin) or "1.19.1".
+         */
+        private val DATE_TAG_REGEX =
+            Regex("""^\d{4}[.\-]\d{1,2}[.\-]\d{1,2}$""")
     }
 }
 

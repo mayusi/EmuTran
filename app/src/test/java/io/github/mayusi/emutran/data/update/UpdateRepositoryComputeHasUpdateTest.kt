@@ -14,10 +14,17 @@ import org.junit.Test
  *
  * [computeHasUpdate] was bumped from private to internal to allow direct testing.
  *
- * The logic is:
+ * The CONSERVATIVE, confidence-biased logic (see KDoc on computeHasUpdate):
  *   - installedVersionCode < 0  → false  (not installed)
  *   - availableVersion == null  → false  (not yet checked)
- *   - strip 'v'/'V' prefix from both sides, then string inequality → true if different
+ *   - either side is a date-style tag, "unknown", a git hash, or otherwise has
+ *     no leading numeric version run → false (indeterminate; never badge)
+ *   - both parse to a SemVer → true iff available is STRICTLY greater
+ *     (equal or downgrade → false)
+ *
+ * This replaces the old raw-string-inequality behavior, which compared the
+ * source's git TAG against the PM versionName and produced a permanent false
+ * "Update" badge on nearly every installed emulator.
  *
  * The repository is constructed with relaxed mocks for all injected deps since
  * computeHasUpdate() is a pure synchronous function that touches no deps.
@@ -107,7 +114,16 @@ class UpdateRepositoryComputeHasUpdateTest {
         assertThat(result).isFalse()
     }
 
-    // ── Different version → true ──────────────────────────────────────────────
+    @Test
+    fun `V uppercase prefix stripped same as v lowercase`() {
+        val result = repo.computeHasUpdate(info(
+            installedVersionName = "V1.14.0",
+            availableVersion     = "v1.14.0",
+        ))
+        assertThat(result).isFalse()
+    }
+
+    // ── Genuinely newer semver → true ─────────────────────────────────────────
 
     @Test
     fun `newer available version - hasUpdate true`() {
@@ -128,24 +144,57 @@ class UpdateRepositoryComputeHasUpdateTest {
     }
 
     @Test
-    fun `older available version - string inequality still returns true`() {
-        // computeHasUpdate uses string inequality only, NOT semver ordering.
-        // Even a "downgrade" tag shows as hasUpdate because the installed
-        // versionName is different.
+    fun `patch bump - 1 dot 17 dot 0 to 1 dot 17 dot 1 - hasUpdate true`() {
         val result = repo.computeHasUpdate(info(
-            installedVersionName = "1.14.0",
-            availableVersion     = "1.13.0",
+            installedVersionName = "1.17.0",
+            availableVersion     = "1.17.1",
         ))
         assertThat(result).isTrue()
     }
 
     @Test
-    fun `date-style tags - different date string - hasUpdate true`() {
+    fun `numeric not lexical - 0 dot 9 to 0 dot 10 - hasUpdate true`() {
+        // Lexical "9" > "10" would wrongly say no update. SemVer is numeric.
+        val result = repo.computeHasUpdate(info(
+            installedVersionName = "0.9.0",
+            availableVersion     = "0.10.0",
+        ))
+        assertThat(result).isTrue()
+    }
+
+    // ── Downgrade / equal → false (conservative bias) ─────────────────────────
+
+    @Test
+    fun `older available version - downgrade - no update`() {
+        // OLD behavior returned true on any string difference. New behavior
+        // uses SemVer ordering: an older available tag is NOT an update.
+        val result = repo.computeHasUpdate(info(
+            installedVersionName = "1.14.0",
+            availableVersion     = "1.13.0",
+        ))
+        assertThat(result).isFalse()
+    }
+
+    @Test
+    fun `equal semver expressed differently - 1 dot 0 vs 1 dot 0 dot 0 - no update`() {
+        val result = repo.computeHasUpdate(info(
+            installedVersionName = "1.0.0",
+            availableVersion     = "1.0",
+        ))
+        assertThat(result).isFalse()
+    }
+
+    // ── Date-style tags → indeterminate → false ───────────────────────────────
+
+    @Test
+    fun `date-style tags - different date string - no update`() {
+        // OLD behavior badged on any date-string difference. A calendar tag is
+        // indeterminate for our SemVer compare, so we never badge on it.
         val result = repo.computeHasUpdate(info(
             installedVersionName = "2024.12.01",
             availableVersion     = "2025.01.15",
         ))
-        assertThat(result).isTrue()
+        assertThat(result).isFalse()
     }
 
     @Test
@@ -158,20 +207,99 @@ class UpdateRepositoryComputeHasUpdateTest {
     }
 
     @Test
-    fun `retroarch tag style r3645 - different - hasUpdate true`() {
+    fun `date-style tags - dash separated - no update`() {
         val result = repo.computeHasUpdate(info(
-            installedVersionName = "r3640",
-            availableVersion     = "r3645",
+            installedVersionName = "2024-12-01",
+            availableVersion     = "2025-01-15",
+        ))
+        assertThat(result).isFalse()
+    }
+
+    // ── Unparseable / unknown / hash → indeterminate → false ──────────────────
+
+    @Test
+    fun `available unknown - indeterminate - no update`() {
+        // HtmlScrapeSource emits literal "unknown" for Dolphin / generic scrapes.
+        val result = repo.computeHasUpdate(info(
+            installedVersionName = "5.0-21449",
+            availableVersion     = "unknown",
+        ))
+        assertThat(result).isFalse()
+    }
+
+    @Test
+    fun `installed unknown - indeterminate - no update`() {
+        val result = repo.computeHasUpdate(info(
+            installedVersionName = "unknown",
+            availableVersion     = "1.15.0",
+        ))
+        assertThat(result).isFalse()
+    }
+
+    @Test
+    fun `git-hash style tag - indeterminate - no update`() {
+        val result = repo.computeHasUpdate(info(
+            installedVersionName = "1.14.0",
+            availableVersion     = "g3ab12cf",
+        ))
+        assertThat(result).isFalse()
+    }
+
+    @Test
+    fun `empty installed versionName - indeterminate - no update`() {
+        val result = repo.computeHasUpdate(info(
+            installedVersionName = "",
+            availableVersion     = "1.15.0",
+        ))
+        assertThat(result).isFalse()
+    }
+
+    // ── Real-world emulator strings ───────────────────────────────────────────
+
+    @Test
+    fun `retroarch arch suffix - installed 1 dot 19 dot 1 vs available 1 dot 19 dot 1 arm64 - no update`() {
+        // The arch suffix must be ignored: same version, just a build label.
+        val result = repo.computeHasUpdate(info(
+            installedVersionName = "1.19.1",
+            availableVersion     = "1.19.1-arm64-v8a",
+        ))
+        assertThat(result).isFalse()
+    }
+
+    @Test
+    fun `retroarch arch suffix - genuinely newer despite suffix - hasUpdate true`() {
+        val result = repo.computeHasUpdate(info(
+            installedVersionName = "1.19.1",
+            availableVersion     = "1.20.0-arm64-v8a",
         ))
         assertThat(result).isTrue()
     }
 
     @Test
-    fun `V uppercase prefix stripped same as v lowercase`() {
+    fun `dolphin rev suffix - installed 5 dot 0 dash 21449 vs available unknown - no update`() {
         val result = repo.computeHasUpdate(info(
-            installedVersionName = "V1.14.0",
-            availableVersion     = "v1.14.0",
+            installedVersionName = "5.0-21449",
+            availableVersion     = "unknown",
         ))
         assertThat(result).isFalse()
+    }
+
+    @Test
+    fun `numeric-only tag - installed 2120 vs available v2120 - no update`() {
+        // Same numeric version, v-prefix on available only.
+        val result = repo.computeHasUpdate(info(
+            installedVersionName = "2120",
+            availableVersion     = "v2120",
+        ))
+        assertThat(result).isFalse()
+    }
+
+    @Test
+    fun `numeric-only tag - installed 2120 vs available 2121 - hasUpdate true`() {
+        val result = repo.computeHasUpdate(info(
+            installedVersionName = "2120",
+            availableVersion     = "2121",
+        ))
+        assertThat(result).isTrue()
     }
 }

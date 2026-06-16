@@ -4,9 +4,9 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import io.github.mayusi.emutran.data.auth.GithubTokenStore
+import io.github.mayusi.emutran.data.update.SelfUpdateProgress
 import io.github.mayusi.emutran.data.update.SelfUpdateRepository
 import io.github.mayusi.emutran.data.update.SelfUpdateResult
-import io.github.mayusi.emutran.domain.download.ApkDownloader
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -23,13 +23,15 @@ import javax.inject.Inject
  * optional GitHub PAT (Personal Access Token) configuration.
  *
  * Self-update states:
- *   [SelfUpdateUiState.Idle]        — no check in progress.
- *   [SelfUpdateUiState.Checking]    — network request in flight.
- *   [SelfUpdateUiState.Available]   — update found; bottom sheet visible.
- *   [SelfUpdateUiState.Downloading] — APK download in progress (0–100%).
- *   [SelfUpdateUiState.Launching]   — system installer launched; waiting for user.
- *   [SelfUpdateUiState.UpToDate]    — latest version; show snackbar.
- *   [SelfUpdateUiState.Failed]      — error; message to show in snackbar.
+ *   [SelfUpdateUiState.Idle]            — no check in progress.
+ *   [SelfUpdateUiState.Checking]        — network request in flight.
+ *   [SelfUpdateUiState.Available]       — update found; bottom sheet visible.
+ *   [SelfUpdateUiState.Downloading]     — APK download in progress (0–100%).
+ *   [SelfUpdateUiState.Launching]       — system installer launched; waiting for user.
+ *   [SelfUpdateUiState.NeedsInstallPermission] — "Install unknown apps" grant
+ *       missing; UI must deep-link to settings and let the user retry (DEFECT 1).
+ *   [SelfUpdateUiState.UpToDate]        — latest version; show snackbar.
+ *   [SelfUpdateUiState.Failed]          — error; message to show in snackbar.
  *
  * FIX 4 changes:
  *   - [SelfUpdateUiState.Downloading] now carries [version] so the shared
@@ -124,9 +126,9 @@ class AboutViewModel @Inject constructor(
                 var lastEmitMs = 0L
                 selfUpdateRepository.downloadAndInstall(apkUrl, sha256Url).collect { progress ->
                     when (progress) {
-                        is ApkDownloader.Progress.Started ->
+                        is SelfUpdateProgress.Started ->
                             _uiState.value = SelfUpdateUiState.Downloading(0, version)
-                        is ApkDownloader.Progress.Chunk -> {
+                        is SelfUpdateProgress.Chunk -> {
                             // FIX 4 throttle: emit at most once per 200ms.
                             val now = System.currentTimeMillis()
                             if (now - lastEmitMs >= DOWNLOAD_EMIT_THROTTLE_MS) {
@@ -137,9 +139,14 @@ class AboutViewModel @Inject constructor(
                                 _uiState.value = SelfUpdateUiState.Downloading(pct, version)
                             }
                         }
-                        is ApkDownloader.Progress.Done ->
+                        is SelfUpdateProgress.Done ->
                             _uiState.value = SelfUpdateUiState.Launching
-                        is ApkDownloader.Progress.Failed ->
+                        // DEFECT 1: surface the missing-permission case as a distinct
+                        // state so the screen can offer a "Open settings" action and
+                        // keep the captured [apkUrl] for a retry after the grant.
+                        is SelfUpdateProgress.NeedsInstallPermission ->
+                            _uiState.value = SelfUpdateUiState.NeedsInstallPermission(apkUrl)
+                        is SelfUpdateProgress.Failed ->
                             _uiState.value = SelfUpdateUiState.Failed(progress.message)
                     }
                 }
@@ -153,6 +160,17 @@ class AboutViewModel @Inject constructor(
                 )
             }
         }
+    }
+
+    /**
+     * DEFECT 1: deep-link the user to the per-app "Install unknown apps" settings
+     * page. Called from the screen when the state is
+     * [SelfUpdateUiState.NeedsInstallPermission]. The state (and its captured
+     * apkUrl) is left intact so the user can grant the permission, return, and
+     * tap "Retry" to resume the install from the cached APK.
+     */
+    fun openInstallPermissionSettings() {
+        selfUpdateRepository.openInstallPermissionSettings()
     }
 
     /**
@@ -182,6 +200,10 @@ class AboutViewModel @Inject constructor(
         // "What's new in vX" doesn't regress to "What's new in v" mid-download.
         data class Downloading(val percent: Int, val version: String) : SelfUpdateUiState
         data object Launching   : SelfUpdateUiState
+        // DEFECT 1: the OS blocked the install because "Install unknown apps" is
+        // off for this app. Carries [apkUrl] so the screen can retry the same
+        // download once the user grants the permission.
+        data class NeedsInstallPermission(val apkUrl: String) : SelfUpdateUiState
         data object UpToDate    : SelfUpdateUiState
         data class Failed(val reason: String) : SelfUpdateUiState
     }

@@ -114,7 +114,12 @@ class HtmlScrapeSource @Inject constructor(
                 apkUrl = abs,
                 // FIX 2: sanitize scraped filename.
                 filename = ApkAssetFilter.sanitizeFilename(rawFilename),
-                version = "$version-$arch", sizeBytes = null,
+                // Emit the clean numeric version ("1.19.1") rather than
+                // "1.19.1-arm64-v8a": the arch suffix is download-arch metadata,
+                // not part of the version, and a clean tag keeps the version
+                // label readable. The update check parses leading numerics
+                // either way, so this does not change update detection.
+                version = version, sizeBytes = null,
                 kind = AssetKind.APK,
             )
         }

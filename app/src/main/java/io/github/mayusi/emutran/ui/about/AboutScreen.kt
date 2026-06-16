@@ -34,8 +34,10 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Snackbar
+import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
@@ -104,6 +106,24 @@ fun AboutScreen(
                 snackbarHostState.showSnackbar("Update check failed: ${s.reason}")
             is AboutViewModel.SelfUpdateUiState.Launching ->
                 snackbarHostState.showSnackbar("Opening system installer…")
+            // DEFECT 1: the OS blocked the install because "Install unknown apps"
+            // is off for EmuTran. Offer an actionable snackbar that deep-links to
+            // the settings page; once enabled the user taps the snackbar again to
+            // retry the cached download.
+            is AboutViewModel.SelfUpdateUiState.NeedsInstallPermission -> {
+                val result = snackbarHostState.showSnackbar(
+                    message = "Allow EmuTran to install apps, then retry.",
+                    actionLabel = "Open settings",
+                    duration = SnackbarDuration.Long,
+                )
+                if (result == SnackbarResult.ActionPerformed) {
+                    vm.openInstallPermissionSettings()
+                    // Reset so the next "Update now" tap re-runs the gated install.
+                    vm.dismissSheet()
+                } else {
+                    vm.dismissSheet()
+                }
+            }
             else -> Unit
         }
         if (uiState is AboutViewModel.SelfUpdateUiState.UpToDate ||

@@ -2,6 +2,13 @@
 
 All notable changes to EmuTran are documented here.
 
+## v0.3.1
+
+### Fixed
+- **In-app update now installs.** The self-updater detected a new release but couldn't install it: it never checked for the per-app "Install unknown apps" permission (required on Android 8+), so the install silently did nothing. It now detects the missing permission, sends you straight to the right settings page, and resumes the install from the already-downloaded file. The install hand-off is also guarded so a failure surfaces a clear message instead of disappearing.
+- **Self-update no longer aborts on a network blip.** The SHA-256 integrity check fetched its checksum file exactly once; a single transient hiccup aborted the whole update before anything downloaded. It now retries with backoff and only refuses to install if the checksum is genuinely unreachable (preserving the integrity guarantee).
+- **Emulator "update available" badges are now accurate.** Update detection compared a source's release tag against the installed app's version string with a plain text match — two values that almost never line up — so nearly every installed emulator showed a permanent "Update" badge that never cleared, and "Update All" re-downloaded versions you already had. Detection now compares real version numbers and only flags an update when a strictly newer version genuinely exists; when a version can't be determined reliably (e.g. date-stamped or unversioned builds) it no longer shows a false badge.
+
 ## v0.3.0
 
 ### Added

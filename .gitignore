@@ -53,6 +53,8 @@ Thumbs.db
 
 # Local orchestration workflow scripts (not part of the app)
 /.audit-*.mjs
+/.update-fix.mjs
+/*.mjs
 
 # Stray Gradle user-home dirs accidentally created in-tree by a relative GRADLE_USER_HOME
 /Tempgradle_*/
