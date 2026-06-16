@@ -2,6 +2,16 @@
 
 All notable changes to EmuTran are documented here.
 
+## v0.3.3
+
+### Fixed
+- **Emulator updates now actually install.** Updating an installed emulator could silently do nothing or hang on "Installing…" forever. The emulator install path never checked for the "Install unknown apps" permission (Android 8+) — so without it, the system installer was blocked with no way forward. It now detects the missing permission, shows a clear message, and sends you to the right settings page; a timeout also prevents the install from hanging indefinitely if the system dialog is dismissed.
+- **The update UI now shows up.** The Dashboard didn't check for emulator updates when you opened it, and the only "Check for updates" button was hidden inside a banner that only appeared once updates were already found — so on a normal visit there was no way to trigger a check. The Dashboard now checks on entry and always shows a "Check for updates" action.
+- Per-app "Update" buttons now disable and show progress the moment you tap them (preventing accidental double-installs), and "Update all" now tells you when there's nothing to update or an update is already running, instead of silently doing nothing.
+
+### Changed
+- Removed dead code and stale comments in the update/install system.
+
 ## v0.3.2
 
 ### Added

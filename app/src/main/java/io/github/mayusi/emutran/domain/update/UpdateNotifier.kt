@@ -100,15 +100,6 @@ class UpdateNotifier @Inject constructor(
         NotificationManagerCompat.from(context).notify(NOTIFICATION_ID, notification)
     }
 
-    /**
-     * Cancel the update notification (e.g. when the user has installed all
-     * updates or the update set is now empty). Safe to call when no
-     * notification is currently shown.
-     */
-    fun cancel() {
-        NotificationManagerCompat.from(context).cancel(NOTIFICATION_ID)
-    }
-
     // ── Private helpers ────────────────────────────────────────────────────
 
     /**

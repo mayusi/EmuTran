@@ -341,6 +341,17 @@ private fun Ready(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+            // Always-visible "Check for updates" affordance. The hero "Update all"
+            // banner only renders when updateCount > 0, so without this the update
+            // UI is absent on a normal visit — a chicken-and-egg. This header action
+            // is reachable regardless of update count and is D-pad focusable.
+            IconButton(onClick = onCheckForUpdates) {
+                Icon(
+                    imageVector = Icons.Outlined.Refresh,
+                    contentDescription = "Check for updates",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             IconButton(onClick = onAbout) {
                 Icon(
                     imageVector = Icons.Outlined.Info,

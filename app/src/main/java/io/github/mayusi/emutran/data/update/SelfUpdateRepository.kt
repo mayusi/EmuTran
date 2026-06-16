@@ -4,7 +4,6 @@ import android.content.ActivityNotFoundException
 import android.content.Context
 import dagger.hilt.android.qualifiers.ApplicationContext
 import io.github.mayusi.emutran.BuildConfig
-import io.github.mayusi.emutran.data.source.GhAsset
 import io.github.mayusi.emutran.data.source.GhRelease
 import io.github.mayusi.emutran.data.source.HttpCache
 import io.github.mayusi.emutran.data.source.parseSha256SidecarBody

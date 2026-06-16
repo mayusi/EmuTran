@@ -62,9 +62,10 @@ import javax.inject.Singleton
  *
  * == Observable state ==
  *
- * [updateState] merges the persisted DataStore state with real-time
- * download/install progress emitted via [updateProgressFlow]. UI agents
- * subscribe to these flows; no method call is needed to start receiving.
+ * [updateState] reflects the persisted DataStore state; real-time
+ * download/install progress is a SEPARATE stream emitted via
+ * [updateProgressFlow]. UI agents subscribe to both flows; no method call is
+ * needed to start receiving.
  */
 @Singleton
 class UpdateRepository @Inject constructor(
@@ -84,9 +85,10 @@ class UpdateRepository @Inject constructor(
 
     /**
      * Map of entryId → [UpdateInfo] for every installed emulator that maps
-     * to a known manifest entry. Emits whenever either:
-     *   - The persisted DataStore state changes (a check completed).
-     *   - A download/install cycle finishes (via [updateProgressFlow]).
+     * to a known manifest entry. Emits whenever the persisted DataStore state
+     * changes (a check completed, or an install re-baselined a version).
+     * Real-time download/install progress is delivered separately via
+     * [updateProgressFlow], not merged here.
      *
      * UI agents should collect this on the main dispatcher via
      * `.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap())`.
@@ -317,6 +319,11 @@ class UpdateRepository @Inject constructor(
             }
             is InstallResult.Cancelled ->
                 updateProgressFlow.emit(UpdateProgress.Cancelled(entryId))
+            // Mirror the self-update path: a missing "Install unknown apps" grant
+            // is NOT a hard failure — emit a distinct state so the UI can route the
+            // user to settings and let them retry once it's enabled.
+            is InstallResult.NeedsPermission ->
+                updateProgressFlow.emit(UpdateProgress.NeedsInstallPermission(entryId))
             is InstallResult.Failed ->
                 updateProgressFlow.emit(UpdateProgress.Failed(entryId, installResult.message))
         }
@@ -331,18 +338,35 @@ class UpdateRepository @Inject constructor(
      *
      * FIX 3b: a Mutex prevents double-invocation (e.g. double-tap on
      * "Update all"). If already running, the new call returns immediately.
+     *
+     * Returns an [UpdateAllResult] so the caller can give the user feedback
+     * instead of silently no-op'ing: [UpdateAllResult.AlreadyRunning] when a
+     * prior run still holds the lock, [UpdateAllResult.NothingToUpdate] when no
+     * entry has a pending update, and [UpdateAllResult.Started] otherwise.
      */
-    suspend fun updateAll() {
-        if (!updateAllMutex.tryLock()) return  // already running — skip
+    suspend fun updateAll(): UpdateAllResult {
+        if (!updateAllMutex.tryLock()) return UpdateAllResult.AlreadyRunning  // already running — skip
         try {
             val pending = updateState().first()
                 .values.filter { it.hasUpdate }.map { it.entryId }
+            if (pending.isEmpty()) return UpdateAllResult.NothingToUpdate
             for (id in pending) {
                 updateOne(id)
             }
+            return UpdateAllResult.Started
         } finally {
             updateAllMutex.unlock()
         }
+    }
+
+    /**
+     * Route the user to the per-app "Install unknown apps" settings page after a
+     * [UpdateProgress.NeedsInstallPermission] emission. Passthrough to
+     * [InstallerRouter.openInstallPermissionSettings] so the VM doesn't need to
+     * inject [InstallerRouter] directly — it already holds this repository.
+     */
+    fun openInstallPermissionSettings() {
+        installer.openInstallPermissionSettings()
     }
 
     // ── Private helpers ────────────────────────────────────────────────────
@@ -488,6 +512,21 @@ data class UpdateInfo(
     val lastCheckedEpoch: Long,
 )
 
+/**
+ * Outcome of [UpdateRepository.updateAll] so the UI can surface a snackbar
+ * instead of letting a no-op "Update all" tap look broken.
+ */
+enum class UpdateAllResult {
+    /** A prior [UpdateRepository.updateAll] run still holds the lock. */
+    AlreadyRunning,
+
+    /** No installed entry currently has a pending update. */
+    NothingToUpdate,
+
+    /** Updates were dispatched (progress flows via [UpdateRepository.updateProgressFlow]). */
+    Started,
+}
+
 /** Real-time events emitted by [UpdateRepository.updateProgressFlow]. */
 sealed interface UpdateProgress {
     val entryId: String
@@ -501,5 +540,14 @@ sealed interface UpdateProgress {
     data class Installing(override val entryId: String) : UpdateProgress
     data class Done(override val entryId: String) : UpdateProgress
     data class Cancelled(override val entryId: String) : UpdateProgress
+
+    /**
+     * DEFECT (emulator install-permission gate): the OS blocked the install
+     * because the per-app "Install unknown apps" grant (Android 8+) is missing.
+     * Distinct from [Failed] so the UI can deep-link the user to settings via
+     * [UpdateRepository.openInstallPermissionSettings] and let them retry,
+     * mirroring [SelfUpdateProgress.NeedsInstallPermission].
+     */
+    data class NeedsInstallPermission(override val entryId: String) : UpdateProgress
     data class Failed(override val entryId: String, val reason: String) : UpdateProgress
 }

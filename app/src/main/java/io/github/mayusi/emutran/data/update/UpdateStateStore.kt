@@ -145,18 +145,12 @@ class UpdateStateStore @Inject constructor(
         context.updateMetaDataStore.data.map { it[dismissedSelfUpdateVersionKey] }
 
     /**
-     * Persist [version] as the version to skip, or pass null to clear the skip
-     * (e.g. when a new release supersedes the skipped one — though currently this is
-     * not called automatically; the dismissal flows naturally when a newer
-     * release appears with a different version string).
+     * Persist [version] as the version to skip. The only caller ([SelfUpdateRepository.skipVersion])
+     * always passes a non-null string, so the null/clear branch has been removed.
      */
-    suspend fun setDismissedSelfUpdateVersion(version: String?) {
+    suspend fun setDismissedSelfUpdateVersion(version: String) {
         context.updateMetaDataStore.edit { prefs ->
-            if (version == null) {
-                prefs.remove(dismissedSelfUpdateVersionKey)
-            } else {
-                prefs[dismissedSelfUpdateVersionKey] = version
-            }
+            prefs[dismissedSelfUpdateVersionKey] = version
         }
     }
 

@@ -532,6 +532,16 @@ class ProgressViewModel @Inject constructor(
                             installedNames += item.entry.name
                         InstallResult.Cancelled ->
                             cancelledNames += item.entry.name
+                        // The OS blocked the install because the per-app "Install
+                        // unknown apps" grant is missing. Surface it as a failure
+                        // for this entry with an actionable reason so the user knows
+                        // to enable the permission (mirrors the dashboard update path
+                        // which deep-links to settings).
+                        InstallResult.NeedsPermission ->
+                            fail(
+                                item.entry,
+                                "Enable 'Install unknown apps' for EmuTran, then retry",
+                            )
                         is InstallResult.Failed ->
                             fail(item.entry, r.message)
                     }

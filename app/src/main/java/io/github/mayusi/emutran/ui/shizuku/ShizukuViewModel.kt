@@ -110,6 +110,14 @@ class ShizukuViewModel @Inject constructor(
                         InstallFlow.InstalledOk
                     }
                     InstallResult.Cancelled -> InstallFlow.Cancelled
+                    // "Install unknown apps" is off for EmuTran, so the OS won't let
+                    // us install Shizuku. Report it as a failure with an actionable
+                    // reason — this VM has no settings deep-link, but the message tells
+                    // the user exactly which permission to enable before retrying.
+                    InstallResult.NeedsPermission ->
+                        InstallFlow.Failed(
+                            "Enable 'Install unknown apps' for EmuTran in system settings, then retry"
+                        )
                     is InstallResult.Failed -> InstallFlow.Failed(r.message)
                 }
             }

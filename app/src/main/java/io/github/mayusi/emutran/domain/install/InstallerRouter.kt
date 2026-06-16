@@ -30,6 +30,21 @@ class InstallerRouter @Inject constructor(
         }
     }
 
+    /**
+     * Whether the OS currently allows this app to install other APKs.
+     * Delegates to [PackageInstallerInstaller] — the dialog path is the one
+     * gated by the per-app "Install unknown apps" grant (Shizuku silent
+     * install bypasses it). Exposed so the emulator-install UI can gate the
+     * same way the self-update path does via [IntentInstaller].
+     */
+    fun canRequestInstalls(): Boolean =
+        packageInstaller.canRequestInstalls()
+
+    /** Deep-link the user to the per-app "Install unknown apps" settings page. */
+    fun openInstallPermissionSettings() {
+        packageInstaller.openManageUnknownAppsSettings()
+    }
+
     /** Exposed for UI to render the current mode. */
     fun currentMode(): Mode =
         if (shizukuAvailability.snapshot() == ShizukuAvailability.State.INSTALLED_AND_GRANTED) {

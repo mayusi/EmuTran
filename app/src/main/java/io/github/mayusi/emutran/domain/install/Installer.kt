@@ -19,5 +19,12 @@ interface Installer {
 sealed interface InstallResult {
     data object Installed : InstallResult
     data object Cancelled : InstallResult
+
+    /**
+     * The OS won't let us install yet — the per-app "Install unknown apps"
+     * grant (Android 8+) is missing. The caller should deep-link the user to
+     * settings (see [InstallerRouter.openInstallPermissionSettings]) and retry.
+     */
+    data object NeedsPermission : InstallResult
     data class Failed(val message: String) : InstallResult
 }

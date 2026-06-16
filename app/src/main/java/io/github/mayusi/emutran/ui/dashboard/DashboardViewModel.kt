@@ -22,6 +22,7 @@ import io.github.mayusi.emutran.data.storage.StorageRootStore
 import io.github.mayusi.emutran.data.update.SelfUpdateProgress
 import io.github.mayusi.emutran.data.update.SelfUpdateRepository
 import io.github.mayusi.emutran.data.update.SelfUpdateResult
+import io.github.mayusi.emutran.data.update.UpdateAllResult
 import io.github.mayusi.emutran.data.update.UpdateInfo
 import io.github.mayusi.emutran.data.update.UpdateProgress
 import io.github.mayusi.emutran.data.update.UpdateRepository
@@ -161,12 +162,29 @@ class DashboardViewModel @Inject constructor(
     init {
         load()
         observeUpdateProgress()
+        checkUpdatesOnEntry()
         checkSelfUpdateBanner()
         refreshEmuHelperInstalled()
         resolveDriverHints()
     }
 
     // ── Update actions ───────────────────────────────────────────────────────
+
+    /**
+     * Populate [updateState] on dashboard entry so the update UI isn't absent on
+     * a normal visit. Uses force=false: the per-entry 6-hour gate keeps this
+     * cheap (no spam) while still running once when nothing has been checked yet.
+     * Failures are swallowed — a background check should never surface an error.
+     */
+    private fun checkUpdatesOnEntry() {
+        viewModelScope.launch {
+            try {
+                updateRepository.checkNow(force = false)
+            } catch (e: Throwable) {
+                Log.d(TAG, "checkUpdatesOnEntry failed: ${e.message ?: e.javaClass.simpleName}", e)
+            }
+        }
+    }
 
     fun checkForUpdates() {
         viewModelScope.launch {
@@ -181,7 +199,13 @@ class DashboardViewModel @Inject constructor(
     fun updateAll() {
         viewModelScope.launch {
             try {
-                updateRepository.updateAll()
+                // Turn updateAll's outcome into feedback so a no-op tap never looks
+                // broken. Started runs silently — per-card progress already shows.
+                when (updateRepository.updateAll()) {
+                    UpdateAllResult.AlreadyRunning -> _userMessage.emit("Already updating")
+                    UpdateAllResult.NothingToUpdate -> _userMessage.emit("Everything is up to date")
+                    UpdateAllResult.Started -> Unit
+                }
             } catch (e: Throwable) {
                 _userMessage.emit("Update all failed: ${e.message ?: e.javaClass.simpleName}")
             }
@@ -189,12 +213,19 @@ class DashboardViewModel @Inject constructor(
     }
 
     fun updateViaRepository(entryId: String) {
+        if (entryId in _busy.value) return
+        // Mark busy immediately so the per-card button disables on tap (prevents
+        // the "button looks inert / double-tap" issue). updateOne emits its
+        // terminal UpdateProgress (Done/Failed/Cancelled/NeedsInstallPermission)
+        // before returning, so clearing _busy in finally is the terminal point.
+        _busy.update { it + entryId }
         viewModelScope.launch {
             try {
                 updateRepository.updateOne(entryId)
             } catch (e: Throwable) {
                 _userMessage.emit("Update failed: ${e.message ?: e.javaClass.simpleName}")
             } finally {
+                _busy.update { it - entryId }
                 refresh()
             }
         }
@@ -208,9 +239,20 @@ class DashboardViewModel @Inject constructor(
                     current + (progress.entryId to progress)
                 }
 
+                // The emulator install hit the "Install unknown apps" wall. Mirror
+                // the self-update NeedsInstallPermission handling: tell the user and
+                // deep-link them straight to the settings page so they can enable it
+                // and retry. This is also a terminal state, so it flows into the
+                // cleanup branch below to clear the per-card progress.
+                if (progress is UpdateProgress.NeedsInstallPermission) {
+                    _userMessage.emit("Enable 'Install unknown apps' to update")
+                    updateRepository.openInstallPermissionSettings()
+                }
+
                 if (progress is UpdateProgress.Done ||
                     progress is UpdateProgress.Cancelled ||
-                    progress is UpdateProgress.Failed
+                    progress is UpdateProgress.Failed ||
+                    progress is UpdateProgress.NeedsInstallPermission
                 ) {
                     val id = progress.entryId
                     delay(1_500)
@@ -218,7 +260,8 @@ class DashboardViewModel @Inject constructor(
                         val cur = current[id]
                         if (cur is UpdateProgress.Done ||
                             cur is UpdateProgress.Cancelled ||
-                            cur is UpdateProgress.Failed
+                            cur is UpdateProgress.Failed ||
+                            cur is UpdateProgress.NeedsInstallPermission
                         ) {
                             current - id
                         } else {

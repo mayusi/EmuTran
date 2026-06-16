@@ -15,8 +15,8 @@ import javax.inject.Singleton
  * ACTION_VIEW + the package-archive MIME type. The user will see the
  * stock "Install / Cancel" dialog once per APK.
  *
- * This is the fallback for users without Shizuku. Week 4 will add the
- * Shizuku silent-install path that bypasses this dialog entirely.
+ * This is the fallback for users without Shizuku; ShizukuInstaller provides
+ * the silent-install path that bypasses this dialog entirely.
  *
  * Two non-obvious requirements satisfied here:
  *  1. The URI must come from FileProvider, not a file:// path —
