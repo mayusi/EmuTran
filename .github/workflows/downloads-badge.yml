@@ -1,0 +1,77 @@
+name: Update APK downloads badge
+
+# Runs daily, on every published release, and on demand.
+on:
+  schedule:
+    - cron: '0 3 * * *'   # 03:00 UTC daily
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to push to the badges branch
+
+jobs:
+  update-badge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute APK-only download count
+        id: count
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Sum download_count for every release asset whose name ends in .apk
+          TOTAL=$(gh api repos/${{ github.repository }}/releases \
+            --paginate \
+            --jq '[.[].assets[] | select(.name | endswith(".apk")) | .download_count] | add // 0')
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+
+      - name: Build shields endpoint JSON
+        run: |
+          mkdir -p badge-out
+          printf '{"schemaVersion":1,"label":"downloads","message":"%s","color":"555"}\n' \
+            "${{ steps.count.outputs.total }}" > badge-out/downloads.json
+          echo "Generated: $(cat badge-out/downloads.json)"
+
+      # Check out (or create as orphan) the badges branch.
+      # We do this without touching the main working tree.
+      - name: Prepare badges branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+
+          # Clone only the badges branch into a scratch dir (shallow, no source code).
+          if git ls-remote --exit-code --heads "$REPO_URL" badges; then
+            git clone --depth 1 --branch badges "$REPO_URL" badges-repo
+          else
+            # Branch does not exist yet — create an orphan.
+            mkdir badges-repo
+            cd badges-repo
+            git init
+            git remote add origin "$REPO_URL"
+            git checkout --orphan badges
+            # Stage a placeholder so the branch can be committed.
+            git commit --allow-empty -m "chore: init badges branch"
+            cd ..
+          fi
+
+      - name: Commit & push JSON (skip if unchanged)
+        run: |
+          DEST="badges-repo/downloads.json"
+          NEW="badge-out/downloads.json"
+
+          # Skip if content is identical to what's already on the branch.
+          if [ -f "$DEST" ] && diff -q "$DEST" "$NEW" > /dev/null 2>&1; then
+            echo "Badge JSON unchanged — nothing to commit."
+            exit 0
+          fi
+
+          cp "$NEW" "$DEST"
+          cd badges-repo
+          git add downloads.json
+          git commit -m "chore: update APK downloads badge (${{ steps.count.outputs.total }} downloads)"
+          git push origin badges

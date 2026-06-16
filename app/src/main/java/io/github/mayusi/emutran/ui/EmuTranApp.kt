@@ -23,6 +23,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import io.github.mayusi.emutran.ui.about.AboutScreen
+import io.github.mayusi.emutran.ui.common.DiscordPromptDialog
 import io.github.mayusi.emutran.ui.dashboard.DashboardScreen
 import io.github.mayusi.emutran.ui.health.HealthCheckScreen
 import io.github.mayusi.emutran.ui.deviceinfo.DeviceInfoScreen
@@ -75,6 +76,7 @@ object Routes {
 @Composable
 fun EmuTranApp(
     bootstrap: AppBootstrapViewModel = hiltViewModel(),
+    discordPrompt: DiscordPromptViewModel = hiltViewModel(),
 ) {
     val startDestination by bootstrap.startDestination.collectAsStateWithLifecycle()
 
@@ -233,6 +235,20 @@ fun EmuTranApp(
                     )
                 }
             }
+        }
+
+        // First-launch-only "Join our Discord" prompt. Rendered as an overlay
+        // above the Scaffold/NavHost. Because this code is only reached after
+        // the early `startDestination == null` return above, the dialog can
+        // never flash over the blank bootstrap/splash background — it appears
+        // only once a real destination has been resolved, and only the first
+        // time ever (gated by the persisted flag in DiscordPromptViewModel).
+        val showDiscordPrompt by discordPrompt.showPrompt.collectAsStateWithLifecycle()
+        if (showDiscordPrompt) {
+            DiscordPromptDialog(
+                onJoin = discordPrompt::onJoin,
+                onDismiss = discordPrompt::dismiss,
+            )
         }
     }
 }

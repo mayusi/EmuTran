@@ -1,5 +1,7 @@
 package io.github.mayusi.emutran.ui.dashboard
 
+import android.content.Intent
+import android.net.Uri
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -22,6 +24,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.automirrored.outlined.FactCheck
+import androidx.compose.material.icons.outlined.Forum
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.SettingsBackupRestore
 import androidx.compose.material.icons.outlined.NewReleases
@@ -55,6 +58,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -68,6 +72,7 @@ import io.github.mayusi.emutran.ui.common.AppInfoDialog
 import io.github.mayusi.emutran.ui.common.CardInstallButton
 import io.github.mayusi.emutran.ui.common.CardUninstallButton
 import io.github.mayusi.emutran.ui.common.CardUpdateButton
+import io.github.mayusi.emutran.ui.common.DISCORD_INVITE_URL
 import io.github.mayusi.emutran.ui.common.Dimens
 import io.github.mayusi.emutran.ui.common.EmulatorCard
 import io.github.mayusi.emutran.ui.common.SelfUpdateSheet
@@ -439,6 +444,81 @@ private fun Ready(
                         onInstall = { onInstall(entry) },
                     )
                 }
+            }
+
+            // Unobtrusive "need help? join Discord" entry at the foot of the
+            // list — below the emulator cards so it never disrupts the primary
+            // setup/update flow. Full-span, monochrome, matches the banner cards.
+            item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(2) }) {
+                SupportCard()
+            }
+        }
+    }
+}
+
+// ── Community & support card ───────────────────────────────────────────────────
+
+/**
+ * Permanent, low-key Discord entry. Mirrors [SelfUpdateBanner]'s monochrome card
+ * style (non-dismissible) — an always-available "need help?" affordance with a
+ * focusable "Join" action. Opens the shared [DISCORD_INVITE_URL] via
+ * [Intent.ACTION_VIEW], the same path the About / update flows use for links.
+ */
+@Composable
+private fun SupportCard() {
+    val context = LocalContext.current
+
+    val openDiscord = {
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(DISCORD_INVITE_URL)).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = EmuTones.container),
+        border = BorderStroke(1.dp, EmuTones.outlineDivider),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.Forum,
+                contentDescription = null,
+                tint = EmuTones.onSurface,
+                modifier = Modifier.size(20.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Need help?",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = EmuTones.onSurface,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    text = "Get setup help and share configs with the community",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = EmuTones.onSurfaceVar,
+                )
+            }
+            Spacer(Modifier.width(4.dp))
+            val joinInteraction = remember { MutableInteractionSource() }
+            TextButton(
+                onClick = openDiscord,
+                interactionSource = joinInteraction,
+                modifier = Modifier.dpadFocusBorder(joinInteraction, cornerRadius = 8.dp),
+            ) {
+                Text(
+                    text = "Join Discord",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = EmuTones.onSurface,
+                )
             }
         }
     }

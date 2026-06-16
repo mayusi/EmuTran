@@ -2,6 +2,11 @@
 
 All notable changes to EmuTran are documented here.
 
+## v0.3.2
+
+### Added
+- **Discord community.** A "Join the EmuTran community" prompt now appears once on first launch, and a permanent "Join Discord" entry lives on both the Dashboard and the About screen — for help with setup, sharing configs, and reporting issues. Invite: https://discord.gg/jEnMYW5YfE
+
 ## v0.3.1
 
 ### Fixed

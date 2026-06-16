@@ -1,7 +1,8 @@
 # EmuTran
 
 [![Latest release](https://img.shields.io/github/v/release/mayusi/EmuTran?style=flat-square&label=release&color=2ea043)](https://github.com/mayusi/EmuTran/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/mayusi/EmuTran/total?style=flat-square&label=downloads&color=555)](https://github.com/mayusi/EmuTran/releases)
+[![Downloads](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/mayusi/EmuTran/badges/downloads.json&style=flat-square)](https://github.com/mayusi/EmuTran/releases)
+[![Discord](https://img.shields.io/badge/discord-join-5865F2?style=flat-square&logo=discord&logoColor=white)](https://discord.gg/jEnMYW5YfE)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Android 10+](https://img.shields.io/badge/android-10%2B-555?style=flat-square)](#requirements)
 
@@ -14,6 +15,12 @@ EmuTran turns the tedious, multi-hour job of setting up an Android gaming handhe
 </p>
 
 The whole app is **controller-first** — every screen is navigable with the D-pad and face buttons, no touchscreen required.
+
+---
+
+## Community & Support
+
+Join the [Discord](https://discord.gg/jEnMYW5YfE) to get help with setup, share your configs, and report issues. It's the fastest way to get a response.
 
 ---
 

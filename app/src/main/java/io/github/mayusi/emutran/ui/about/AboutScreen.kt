@@ -18,6 +18,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.OpenInNew
+import androidx.compose.material.icons.outlined.Forum
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
@@ -61,6 +62,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.mayusi.emutran.BuildConfig
 import io.github.mayusi.emutran.data.auth.GithubTokenStore
+import io.github.mayusi.emutran.ui.common.DISCORD_INVITE_URL
 import io.github.mayusi.emutran.ui.common.Dimens
 import io.github.mayusi.emutran.ui.common.SelfUpdateSheet
 import io.github.mayusi.emutran.ui.common.dpadFocusBorder
@@ -218,6 +220,34 @@ fun AboutScreen(
                 Spacer(Modifier.width(8.dp))
                 Text(
                     text = "View on GitHub",
+                    style = MaterialTheme.typography.labelLarge,
+                )
+            }
+
+            // "Join our Discord" — permanent community & support link. Opens the
+            // shared DISCORD_INVITE_URL via the same Intent.ACTION_VIEW path as
+            // the GitHub button above.
+            val discordInteraction = remember { MutableInteractionSource() }
+            OutlinedButton(
+                onClick = {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(DISCORD_INVITE_URL)).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    context.startActivity(intent)
+                },
+                interactionSource = discordInteraction,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .dpadFocusBorder(discordInteraction, cornerRadius = 50.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.Forum,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = "Join our Discord",
                     style = MaterialTheme.typography.labelLarge,
                 )
             }
