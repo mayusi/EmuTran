@@ -3,6 +3,8 @@ package io.github.mayusi.emutran.domain.install
 import android.content.Context
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
@@ -56,11 +58,25 @@ class ShizukuInstaller @Inject constructor(
                 apk.inputStream().use { src -> src.copyTo(out) }
             }
 
-            val exit = process.javaClass.getMethod("waitFor").invoke(process) as Int
-            val stdout = (process.javaClass.getMethod("getInputStream").invoke(process)
-                as java.io.InputStream).bufferedReader().use { it.readText() }
-            val stderr = (process.javaClass.getMethod("getErrorStream").invoke(process)
-                as java.io.InputStream).bufferedReader().use { it.readText() }
+            // Drain stdout AND stderr CONCURRENTLY with waitFor(). pm install can
+            // emit more output than the OS pipe buffer holds; if we only read after
+            // waitFor() returns, the subprocess blocks writing into a full pipe while
+            // we block on waitFor() → deadlock on large/verbose installs. Reading both
+            // streams on background IO coroutines while we wait keeps the pipes drained.
+            val stdoutStream = process.javaClass.getMethod("getInputStream").invoke(process)
+                as java.io.InputStream
+            val stderrStream = process.javaClass.getMethod("getErrorStream").invoke(process)
+                as java.io.InputStream
+            val (exit, stdout, stderr) = coroutineScope {
+                val stdoutJob = async(Dispatchers.IO) {
+                    stdoutStream.bufferedReader().use { it.readText() }
+                }
+                val stderrJob = async(Dispatchers.IO) {
+                    stderrStream.bufferedReader().use { it.readText() }
+                }
+                val code = process.javaClass.getMethod("waitFor").invoke(process) as Int
+                Triple(code, stdoutJob.await(), stderrJob.await())
+            }
 
             if (exit == 0 && "Success" in stdout) {
                 InstallResult.Installed

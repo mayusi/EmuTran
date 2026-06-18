@@ -212,11 +212,33 @@ class ObtainiumPackParser @Inject constructor(
         return parseJson(text)
     }
 
-    /** Write [body] to [Context.filesDir]/manifest/[filename]. */
+    /**
+     * Write [body] to [Context.filesDir]/manifest/[filename] atomically.
+     *
+     * A plain writeText() truncates-then-writes in place, so a process kill
+     * mid-write leaves a half-written (corrupt) manifest on disk that the
+     * offline fallback chain would then fail to parse forever. Instead we write
+     * the full body to a sibling "<filename>.tmp" and only [File.renameTo] it
+     * over the final path once the write fully succeeded — a rename is atomic on
+     * the same filesystem, so a reader ever only sees the old or new complete
+     * file. The tmp file is cleaned up if the write or rename fails.
+     */
     private fun persistToDisk(filename: String, body: String) {
         val file = diskFile(filename)
         file.parentFile?.mkdirs()
-        file.writeText(body)
+        val tmp = File(file.parentFile, "$filename.tmp")
+        try {
+            tmp.writeText(body)
+            if (!tmp.renameTo(file)) {
+                // renameTo can fail (e.g. across mounts); fall back to a direct
+                // write so the refreshed copy is at least persisted, then clean up.
+                file.writeText(body)
+                tmp.delete()
+            }
+        } catch (t: Throwable) {
+            tmp.delete()
+            throw t
+        }
     }
 
     private fun diskFile(filename: String): File =

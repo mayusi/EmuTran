@@ -26,9 +26,11 @@ import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.automirrored.outlined.FactCheck
 import androidx.compose.material.icons.outlined.Forum
 import androidx.compose.material.icons.outlined.Info
-import androidx.compose.material.icons.outlined.SettingsBackupRestore
+import androidx.compose.material.icons.outlined.Memory
 import androidx.compose.material.icons.outlined.NewReleases
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.SettingsBackupRestore
+import androidx.compose.material.icons.outlined.SwapHoriz
 import androidx.compose.material.icons.outlined.SystemUpdate
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -106,6 +108,8 @@ fun DashboardScreen(
     onQuickSetup: () -> Unit = {},
     onHealthCheck: () -> Unit = {},
     onProfile: () -> Unit = {},
+    onBiosHelper: () -> Unit = {},
+    onSortRoms: () -> Unit = {},
     vm: DashboardViewModel = hiltViewModel(),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -198,6 +202,8 @@ fun DashboardScreen(
                 onAbout = onAbout,
                 onHealthCheck = onHealthCheck,
                 onProfile = onProfile,
+                onBiosHelper = onBiosHelper,
+                onSortRoms = onSortRoms,
                 onCheckForUpdates = vm::checkForUpdates,
                 onUpdateAll = vm::updateAll,
                 onUpdate = { entry -> vm.updateViaRepository(entry.id) },
@@ -307,6 +313,8 @@ private fun Ready(
     onAbout: () -> Unit,
     onHealthCheck: () -> Unit,
     onProfile: () -> Unit,
+    onBiosHelper: () -> Unit,
+    onSortRoms: () -> Unit,
     onCheckForUpdates: () -> Unit,
     onUpdateAll: () -> Unit,
     onUpdate: (AppEntry) -> Unit,
@@ -370,6 +378,20 @@ private fun Ready(
                 Icon(
                     imageVector = Icons.Outlined.SettingsBackupRestore,
                     contentDescription = "Backup or restore setup profile",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            IconButton(onClick = onBiosHelper) {
+                Icon(
+                    imageVector = Icons.Outlined.Memory,
+                    contentDescription = "BIOS Helper",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            IconButton(onClick = onSortRoms) {
+                Icon(
+                    imageVector = Icons.Outlined.SwapHoriz,
+                    contentDescription = "Sort ROMs",
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }

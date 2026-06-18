@@ -4,8 +4,10 @@ import io.github.mayusi.emutran.data.device.GpuFamily
 import io.github.mayusi.emutran.data.device.GpuInfo
 import io.github.mayusi.emutran.data.source.GhAsset
 import io.github.mayusi.emutran.data.source.GhRelease
+import io.github.mayusi.emutran.data.source.HttpCache
 import io.github.mayusi.emutran.data.source.HttpsDowngradeInterceptor
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
@@ -54,6 +56,9 @@ class DriverStager @Inject constructor(
     private val client: OkHttpClient,
     // Shared kotlinx.serialization Json (ignoreUnknownKeys = true) from AppModule.
     private val json: Json,
+    // FIX 10: ETag/body cache so discover() doesn't burn a GitHub rate-limit token
+    // on every invocation. Same HttpCache used by GitHubReleasesSource / GiteaSource.
+    private val cache: HttpCache,
 ) {
 
     /**
@@ -79,16 +84,30 @@ class DriverStager @Inject constructor(
         }
 
         try {
+            // FIX 10: send If-None-Match if we've cached this endpoint before. A 304
+            // costs no rate-limit token, so repeated discover() calls stay near-free.
+            val cached = cache.get(RELEASES_ENDPOINT)
             val req = Request.Builder()
-                .url("https://api.github.com/repos/K11MCH1/AdrenoToolsDrivers/releases?per_page=30")
+                .url(RELEASES_ENDPOINT)
                 .header("Accept", "application/vnd.github+json")
+                .apply { cached?.let { header("If-None-Match", it.etag) } }
                 .build()
             client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) {
-                    return@withContext DiscoverResult.Failed("GitHub HTTP ${resp.code}")
+                // 304 Not Modified → reuse the cached body, no token spent.
+                val body: String = if (resp.code == 304 && cached != null) {
+                    cached.body
+                } else {
+                    if (!resp.isSuccessful) {
+                        return@withContext DiscoverResult.Failed("GitHub HTTP ${resp.code}")
+                    }
+                    val fresh = resp.body?.string()
+                        ?: return@withContext DiscoverResult.Failed("Empty response")
+                    // Cache the ETag for future If-None-Match requests.
+                    resp.header("ETag")?.let { etag ->
+                        cache.put(RELEASES_ENDPOINT, HttpCache.Entry(etag, fresh, System.currentTimeMillis()))
+                    }
+                    fresh
                 }
-                val body = resp.body?.string()
-                    ?: return@withContext DiscoverResult.Failed("Empty response")
                 val releases: List<GhRelease> = json.decodeFromString(body)
                 val selection = selectAssetsForGpu(releases, gpu)
                 if (selection.assets.isEmpty()) {
@@ -217,25 +236,9 @@ class DriverStager @Inject constructor(
         val saved = mutableListOf<File>()
         val failed = mutableListOf<Pair<String, String>>()
         for (asset in picked) {
-            val out = File(turnipDir, asset.name)
-            try {
-                // Use downloadClient (HTTPS-downgrade interceptor) for all fetches.
-                downloadClient.newCall(Request.Builder().url(asset.url).build()).execute().use { resp ->
-                    if (!resp.isSuccessful) {
-                        failed += asset.name to "HTTP ${resp.code}"
-                        return@use
-                    }
-                    val body = resp.body ?: run {
-                        failed += asset.name to "Empty body"
-                        return@use
-                    }
-                    body.byteStream().use { input ->
-                        out.outputStream().use { o -> input.copyTo(o) }
-                    }
-                    saved += out
-                }
-            } catch (t: Throwable) {
-                failed += asset.name to (t.message ?: t.javaClass.simpleName)
+            when (val r = downloadAsset(asset, turnipDir)) {
+                is AssetDownload.Ok -> saved += r.file
+                is AssetDownload.Err -> failed += asset.name to r.reason
             }
         }
 
@@ -246,6 +249,67 @@ class DriverStager @Inject constructor(
         }
 
         StageResult.Done(saved = saved.map { it.name }, failed = failed)
+    }
+
+    /**
+     * FIX 2: Download a single [asset] into [turnipDir] safely.
+     *
+     * Writes to a "<name>.tmp" sidecar and only atomically renames it onto the
+     * final name after a fully successful body copy. A disk-full / dropped-socket
+     * failure mid-write therefore leaves only the temp file (which we delete),
+     * never a half-written zip that the driver health check would falsely PASS.
+     *
+     * Transient failures (non-success HTTP, empty body, IOException) are retried
+     * with a short exponential backoff, mirroring [ApkDownloader]'s retry shape.
+     */
+    private suspend fun downloadAsset(asset: Asset, turnipDir: File): AssetDownload {
+        val out = File(turnipDir, asset.name)
+        val tmp = File(turnipDir, asset.name + ".tmp")
+        var lastReason = "Unknown error"
+
+        for (attempt in 1..MAX_ATTEMPTS) {
+            // Start each attempt from a clean temp file.
+            tmp.delete()
+            try {
+                // Use downloadClient (HTTPS-downgrade interceptor) for all fetches.
+                downloadClient.newCall(Request.Builder().url(asset.url).build()).execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        lastReason = "HTTP ${resp.code}"
+                        return@use
+                    }
+                    val body = resp.body ?: run {
+                        lastReason = "Empty body"
+                        return@use
+                    }
+                    body.byteStream().use { input ->
+                        tmp.outputStream().use { o -> input.copyTo(o) }
+                    }
+                    // Atomic publish: rename succeeds only after the full body landed.
+                    // Delete any stale final file first so rename can't fail on Windows-y FS.
+                    out.delete()
+                    if (!tmp.renameTo(out)) {
+                        // Fall back to copy+delete if rename across the same dir fails.
+                        tmp.copyTo(out, overwrite = true)
+                        tmp.delete()
+                    }
+                    return AssetDownload.Ok(out)
+                }
+            } catch (t: Throwable) {
+                lastReason = t.message ?: t.javaClass.simpleName
+            }
+
+            // Reached here = transient failure this attempt. Clean the partial temp.
+            tmp.delete()
+            if (attempt < MAX_ATTEMPTS) {
+                delay(BASE_RETRY_DELAY_MS * (1L shl (attempt - 1)))  // 0.5s, 1s
+            }
+        }
+        return AssetDownload.Err(lastReason)
+    }
+
+    private sealed interface AssetDownload {
+        data class Ok(val file: File) : AssetDownload
+        data class Err(val reason: String) : AssetDownload
     }
 
     private fun readmeBody(savedFilenames: List<String>): String = buildString {
@@ -299,6 +363,17 @@ class DriverStager @Inject constructor(
     }
 
     companion object {
+        // FIX 2: atomic-download retry budget. 1 initial + 2 retries with a short
+        // backoff (0.5s, 1s) — mirrors ApkDownloader's transient-retry shape but
+        // smaller since driver staging is a background convenience, not a blocker.
+        private const val MAX_ATTEMPTS = 3
+        private const val BASE_RETRY_DELAY_MS = 500L
+
+        // FIX 10: the AdrenoToolsDrivers releases endpoint, routed through HttpCache
+        // with an ETag so repeated discover() calls cost no rate-limit token on 304.
+        private const val RELEASES_ENDPOINT =
+            "https://api.github.com/repos/K11MCH1/AdrenoToolsDrivers/releases?per_page=30"
+
         // Hoisted so they compile once instead of on every selectAssetsForGpu
         // call. Matched against the lowercased, '-'→'_' normalised asset name.
 

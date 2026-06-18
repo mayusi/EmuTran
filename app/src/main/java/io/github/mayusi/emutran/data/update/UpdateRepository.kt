@@ -15,6 +15,8 @@ import io.github.mayusi.emutran.domain.install.InstallerRouter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.first
@@ -76,8 +78,8 @@ class UpdateRepository @Inject constructor(
     private val installer: InstallerRouter,
     private val store: UpdateStateStore,
     private val setupOptions: SetupOptionsStore,
-    // FIX 3a: inject InstalledAppsRegistry so we use its cached PM snapshot
-    // instead of doing N full scans per check cycle.
+    // Inject InstalledAppsRegistry so we use its cached PM snapshot instead of
+    // doing N full scans per check cycle.
     private val installedAppsRegistry: InstalledAppsRegistry,
 ) {
 
@@ -133,20 +135,20 @@ class UpdateRepository @Inject constructor(
      *   button). When false (background worker), entries checked < 6h ago
      *   are skipped.
      *
-     * FIX 1b: all results are collected in-memory and written to DataStore in
-     * ONE transaction at the end (via [UpdateStateStore.putAllUpdateInfo]),
+     * All results are collected in-memory and written to DataStore in ONE
+     * transaction at the end (via [UpdateStateStore.putAllUpdateInfo]),
      * producing 1 DataStore emission instead of N. This eliminates the
      * O(n²) re-decode of all entry blobs on every single write.
      *
-     * FIX 3a: uses [InstalledAppsRegistry.snapshot] for the installed-package
-     * set, then performs ONE additional PM query for versionCode/versionName on
-     * only the matching packages — avoiding N full PM scans per check.
+     * Uses [InstalledAppsRegistry.snapshot] for the installed-package set, then
+     * performs ONE additional PM query for versionCode/versionName on only the
+     * matching packages — avoiding N full PM scans per check.
      */
     suspend fun checkNow(force: Boolean = false) = withContext(Dispatchers.IO) {
         val entries = loadManifestEntries()
 
-        // FIX 3a: use the registry's cached Set<String> to find which entries
-        // are installed, then do a single targeted PM query for versionCode/Name.
+        // Use the registry's cached Set<String> to find which entries are
+        // installed, then do a single targeted PM query for versionCode/Name.
         val installedPackageNames = installedAppsRegistry.snapshot()
         val installedInfoMap = queryVersionInfoForPackages(installedPackageNames)
 
@@ -159,7 +161,7 @@ class UpdateRepository @Inject constructor(
         val semaphore = Semaphore(MAX_CONCURRENT_RESOLVES)
         val nowMs = System.currentTimeMillis()
 
-        // FIX 1b: collect all results in-memory first.
+        // Collect all results in-memory first.
         val pendingWrites = mutableListOf<UpdateStateStore.PersistedUpdateInfo>()
         val pendingWritesMutex = Mutex()
 
@@ -202,7 +204,7 @@ class UpdateRepository @Inject constructor(
             jobs.forEach { it.await() }
         }
 
-        // FIX 1b: ONE DataStore transaction writes all entries — 1 emission, not N.
+        // ONE DataStore transaction writes all entries — 1 emission, not N.
         store.putAllUpdateInfo(pendingWrites)
     }
 
@@ -235,8 +237,7 @@ class UpdateRepository @Inject constructor(
             return@withContext
         }
 
-        // FIX 1 (SHA-256 sidecar): resolved.sha256 is always null (sources only set
-        // sha256Url), so passing it left updates installing UNVERIFIED. Mirror the
+        // SHA-256 sidecar: integrity is driven solely by sha256Url. Mirror the
         // SETUP path (ProgressViewModel): when the source published a sidecar, fetch
         // the hash now and treat a fetch failure as a HARD error — never install
         // without the integrity check. When no sidecar exists, proceed unverified.
@@ -291,7 +292,7 @@ class UpdateRepository @Inject constructor(
 
         when (installResult) {
             is InstallResult.Installed -> {
-                // FIX 3a: refresh the registry then snapshot for just this package
+                // Refresh the registry then snapshot for just this package
                 // instead of doing a full PM scan (installedPackages() call removed).
                 installedAppsRegistry.refresh()
                 val currentInfo = store.getUpdateInfo(entryId)
@@ -304,7 +305,7 @@ class UpdateRepository @Inject constructor(
                                 ?: currentInfo.installedVersionCode,
                             installedVersionName = freshPkgInfo?.versionName
                                 ?: currentInfo.installedVersionName,
-                            // FIX (re-baseline): re-stamp availableVersion to the tag we
+                            // Re-baseline: re-stamp availableVersion to the tag we
                             // just installed. The PM versionName and the source tag live in
                             // different namespaces (e.g. "1.19.1" vs "1.19.1-arm64-v8a"), so
                             // leaving availableVersion at the old resolved tag could keep the
@@ -329,15 +330,15 @@ class UpdateRepository @Inject constructor(
         }
     }
 
-    // FIX 3b: guard updateAll() against concurrent invocation.
+    // Guard updateAll() against concurrent invocation.
     private val updateAllMutex = Mutex()
 
     /**
      * Update all entries that currently have [UpdateInfo.hasUpdate] = true.
      * Runs installs sequentially (PackageInstaller requires serial sessions).
      *
-     * FIX 3b: a Mutex prevents double-invocation (e.g. double-tap on
-     * "Update all"). If already running, the new call returns immediately.
+     * A Mutex prevents double-invocation (e.g. double-tap on "Update all").
+     * If already running, the new call returns immediately.
      *
      * Returns an [UpdateAllResult] so the caller can give the user feedback
      * instead of silently no-op'ing: [UpdateAllResult.AlreadyRunning] when a
@@ -351,6 +352,12 @@ class UpdateRepository @Inject constructor(
                 .values.filter { it.hasUpdate }.map { it.entryId }
             if (pending.isEmpty()) return UpdateAllResult.NothingToUpdate
             for (id in pending) {
+                // Honour cancellation promptly between items: each updateOne can
+                // sit on a ~90s install dialog, so a cancelled job must not march
+                // on into the next install. Per-item progress is already streamed
+                // live via updateProgressFlow, so the UI keeps up even though
+                // updateAll() only returns once every item finishes.
+                currentCoroutineContext().ensureActive()
                 updateOne(id)
             }
             return UpdateAllResult.Started
@@ -383,8 +390,8 @@ class UpdateRepository @Inject constructor(
         }
 
     /**
-     * FIX 3a: Query the PM for only the packages that match the installed
-     * set. Returns a Map<packageName, PackageInfo> with versionCode + name.
+     * Query the PM for only the packages that match the installed set.
+     * Returns a Map<packageName, PackageInfo> with versionCode + name.
      * Does ONE PM scan and filters — far cheaper than scanning all packages
      * twice (once for names, once per-entry inside updateOne).
      */
@@ -399,7 +406,7 @@ class UpdateRepository @Inject constructor(
             }
             list.filter { it.packageName in packageNames }.associateBy { it.packageName }
         } catch (t: Throwable) {
-            // DEFECT 4 (silent-zero): a PM bulk-query failure here used to vanish
+            // Silent-zero guard: a PM bulk-query failure here used to vanish
             // every badge silently (all versionCodes fall to -1). Log it so the
             // failure is at least diagnosable; we still return emptyMap because a
             // partial result isn't available and over-engineering a retry here is
@@ -464,13 +471,16 @@ class UpdateRepository @Inject constructor(
 
     /**
      * Heuristic: does this tag look like a calendar version rather than a
-     * semantic version? Matches a 4-digit year followed by month/day parts
-     * separated by '.' or '-' (e.g. "2024.12.01", "2025-01-15"). Used to keep
-     * date-style emulator tags out of the SemVer comparison so they never
+     * semantic version? Matches a 4-digit year followed by a month part (and an
+     * optional day part) separated by '.' or '-' (e.g. "2024.12.01",
+     * "2025-01-15"). A trailing build suffix is tolerated ("2024-12-01-build4")
+     * so date-with-suffix tags are still treated as indeterminate rather than
+     * slipping through to parse as a numeric SemVer and badge forever. Used to
+     * keep date-style emulator tags out of the SemVer comparison so they never
      * produce a false update badge.
      */
     private fun looksLikeDate(raw: String): Boolean =
-        DATE_TAG_REGEX.matches(raw.trim())
+        DATE_TAG_REGEX.matches(raw.trim().trimStart('v', 'V'))
 
     companion object {
         /** Minimum age between automatic checks for a single entry: 6 hours. */
@@ -484,12 +494,14 @@ class UpdateRepository @Inject constructor(
         private const val TAG = "UpdateRepository"
 
         /**
-         * Calendar-version tag: 4-digit year + 2 numeric parts separated by
-         * '.' or '-' (e.g. "2024.12.01", "2025-01-15"). Anchored on a 4-digit
-         * lead so it never matches "5.0-21449" (Dolphin) or "1.19.1".
+         * Calendar-version tag: 4-digit year + a month part and an optional day
+         * part separated by '.' or '-', with any trailing junk tolerated
+         * (e.g. "2024.12.01", "2025-01-15", "2024-12-01-build4"). Anchored on a
+         * 4-digit lead followed by a separator so it never matches "5.0-21449"
+         * (Dolphin), "1.19.1", or a bare numeric tag like "2120"/"v2120".
          */
         private val DATE_TAG_REGEX =
-            Regex("""^\d{4}[.\-]\d{1,2}[.\-]\d{1,2}$""")
+            Regex("""^\d{4}[.\-]\d{1,2}([.\-]\d{1,2})?.*$""")
     }
 }
 

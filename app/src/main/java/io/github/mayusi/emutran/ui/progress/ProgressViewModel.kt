@@ -56,7 +56,8 @@ import javax.inject.Inject
  *
  * Per-app failures (download error, resolve error, asset not found) do
  * NOT abort the whole run — we log them and surface a summary at the end.
- * Shizuku silent install is Week 4; for now every install needs a tap.
+ * Shizuku silent install is used automatically when Shizuku is installed
+ * and granted; otherwise each install needs a tap.
  */
 @HiltViewModel
 class ProgressViewModel @Inject constructor(
@@ -409,6 +410,9 @@ class ProgressViewModel @Inject constructor(
                     fail(entry, "Source not supported (${entry.source})")
             }
         }
+        // Source-rot self-healing: log which entries recovered via a fallback tier
+        // so the Done summary can annotate them (e.g. "Dolphin (older release)").
+        // The annotation is purely cosmetic — the install result is the same either way.
         if (resolved.isEmpty()) {
             return ProcessResult(emptyList(), emptyList(), failures, failedEntrySet.values.toList())
         }
@@ -421,6 +425,10 @@ class ProgressViewModel @Inject constructor(
             val entry: AppEntry,
             val file: File,
             val kind: io.github.mayusi.emutran.data.source.AssetKind,
+            // Source-rot self-healing: non-null if the entry was resolved via a
+            // fallback tier. Carried through to the install phase so the Done
+            // summary can annotate it (e.g. "Dolphin (older release)").
+            val recoveredVia: io.github.mayusi.emutran.data.source.RecoveryTier? = null,
         )
         val downloaded = mutableListOf<Downloaded>()
         for ((index, item) in resolved.withIndex()) {
@@ -486,7 +494,14 @@ class ProgressViewModel @Inject constructor(
                         fail(item.entry, p.message)
                 }
             }
-            apkFile?.let { downloaded += Downloaded(item.entry, it, item.info.kind) }
+            apkFile?.let {
+                downloaded += Downloaded(
+                    entry = item.entry,
+                    file = it,
+                    kind = item.info.kind,
+                    recoveredVia = item.info.recoveredVia,
+                )
+            }
         }
         if (downloaded.isEmpty()) {
             return ProcessResult(emptyList(), emptyList(), failures, failedEntrySet.values.toList())
@@ -521,15 +536,28 @@ class ProgressViewModel @Inject constructor(
                     val dest = File(turnipDir, item.file.name)
                     try {
                         item.file.copyTo(dest, overwrite = true)
-                        installedNames += "${item.entry.name} (driver)"
+                        val driverLabel = if (item.recoveredVia != null) {
+                            "${item.entry.name} (driver — older release)"
+                        } else {
+                            "${item.entry.name} (driver)"
+                        }
+                        installedNames += driverLabel
                     } catch (t: Throwable) {
                         fail(item.entry, t.message ?: "Copy failed")
                     }
                 }
                 io.github.mayusi.emutran.data.source.AssetKind.APK -> {
                     when (val r = installer.install(item.file)) {
-                        InstallResult.Installed ->
-                            installedNames += item.entry.name
+                        InstallResult.Installed -> {
+                            // Source-rot self-healing: annotate the Done summary when
+                            // the install used a fallback (older) release.
+                            val installedLabel = if (item.recoveredVia != null) {
+                                "${item.entry.name} (older release — latest unavailable)"
+                            } else {
+                                item.entry.name
+                            }
+                            installedNames += installedLabel
+                        }
                         InstallResult.Cancelled ->
                             cancelledNames += item.entry.name
                         // The OS blocked the install because the per-app "Install

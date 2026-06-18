@@ -28,7 +28,14 @@ object ApkAssetFilter {
 
     // FIX 4: Cache compiled regexes keyed on pattern string to avoid recompiling per call.
     // ConcurrentHashMap is safe for concurrent resolve() calls in the Phase-3 semaphore loop.
+    // FIX 11: ConcurrentHashMap rejects null values, so a pattern that fails to compile must
+    // NOT be stored here (doing so via getOrPut throws NPE). Only successful compiles land here;
+    // patterns known to be bad are tracked separately in [badPatterns] so we skip recompiling them.
     private val regexCache = ConcurrentHashMap<String, Regex>()
+
+    // FIX 11: Patterns that already failed to compile (or were rejected). A ConcurrentHashMap-backed
+    // set so concurrent resolves can share the negative result without re-attempting Regex(pattern).
+    private val badPatterns = ConcurrentHashMap.newKeySet<String>()
 
     // FIX 4: Maximum allowed pattern length — arbitrary-long patterns from a third-party
     // manifest could be used for ReDoS. Reject anything over this limit.
@@ -123,23 +130,37 @@ object ApkAssetFilter {
      *   - Patterns containing obvious nested-quantifier shapes that cause
      *     catastrophic backtracking (e.g. `(.+)+`, `(a*)*`).
      *
-     * Results are cached in [regexCache] so each distinct pattern is only
-     * compiled once across multiple resolve() calls.
+     * Successful compiles are cached in [regexCache] so each distinct pattern is
+     * only compiled once across multiple resolve() calls. Patterns that fail to
+     * compile (or are rejected) are remembered in [badPatterns] so we don't retry
+     * them — but they are NEVER stored in [regexCache], whose ConcurrentHashMap
+     * backing would throw NPE on a null value (FIX 11).
      *
      * Returns null on rejection or compile failure (caller skips filtering).
      */
     private fun compileFilterRegex(pattern: String): Regex? {
+        // Fast paths: already-compiled hit, or known-bad pattern we won't retry.
+        regexCache[pattern]?.let { return it }
+        if (pattern in badPatterns) return null
+
         if (pattern.length > MAX_PATTERN_LENGTH) {
             android.util.Log.w(TAG, "apkFilterRegEx rejected: length ${pattern.length} > $MAX_PATTERN_LENGTH")
+            badPatterns.add(pattern)
             return null
         }
         if (NESTED_QUANTIFIER_REGEX.containsMatchIn(pattern)) {
             android.util.Log.w(TAG, "apkFilterRegEx rejected: suspected nested quantifiers in '$pattern'")
+            badPatterns.add(pattern)
             return null
         }
-        return regexCache.getOrPut(pattern) {
-            runCatching { Regex(pattern, RegexOption.IGNORE_CASE) }.getOrNull() ?: return null
+        // FIX 11: compile into a local first; only cache a SUCCESSFUL Regex.
+        val compiled = runCatching { Regex(pattern, RegexOption.IGNORE_CASE) }.getOrNull()
+        if (compiled == null) {
+            android.util.Log.w(TAG, "apkFilterRegEx rejected: failed to compile '$pattern'")
+            badPatterns.add(pattern)
+            return null
         }
+        return regexCache.getOrPut(pattern) { compiled }
     }
 
     private const val MAX_FILENAME_LENGTH = 128

@@ -2,6 +2,23 @@
 
 All notable changes to EmuTran are documented here.
 
+## v0.3.4
+
+### Added
+- **BIOS Helper.** A new guided screen (from the Dashboard) that shows, per system, exactly which BIOS files you still need, the folder to drop them in, and whether the files you've placed are verified-good against known reference hashes — so you can tell a good dump from a bad one at a glance. EmuTran never provides BIOS files; this only inspects your own.
+- **ROM sorter.** A new tool that scans your device for game files you've already copied over (Downloads, SD card, anywhere) and offers to move them into the correct `Emulation/roms/<system>/` folders by type — with a "needs your choice" bucket for ambiguous formats. Every move is explicit and confirmed; files are never deleted unless the move fully succeeds, and nothing is ever downloaded.
+- **Resilient downloads.** When an emulator's latest release is unavailable (a dead or moved source), EmuTran now automatically falls back to an older release from the same trusted source before giving up, and tells you when it did — so a rotted source no longer dead-ends a setup. Integrity verification still applies on every fallback.
+
+### Fixed
+- **Security:** the Dashboard "Install" button now verifies downloaded APKs against their SHA-256 checksum, matching the setup and update paths (it previously installed unverified).
+- Shizuku installs of large/verbose APKs could deadlock on "Installing…" — fixed the output-draining order so they no longer hang.
+- GPU driver downloads are now written atomically (no more corrupt half-written driver zips on a disk-full or network drop), with a retry on transient failures, and the driver-discovery call is now cached so repeated setups don't burn the GitHub rate limit.
+- The emulator catalog cache and manifest are now written atomically, so a process kill mid-write can't permanently corrupt them.
+- A bad catalog filter pattern no longer crashes that emulator's resolution; date-stamped nightly tags with a build suffix no longer show a permanent false "update" badge; "Update all" respects cancellation between items.
+
+### Changed
+- Removed dead code and stale comments across the update, install, and source layers; consolidated duplicated helpers.
+
 ## v0.3.3
 
 ### Fixed

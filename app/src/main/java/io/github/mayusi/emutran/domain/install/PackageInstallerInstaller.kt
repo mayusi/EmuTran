@@ -34,8 +34,7 @@ import kotlin.coroutines.resume
  * The loop therefore awaits each install before starting the next,
  * giving the user a clean one-at-a-time experience.
  *
- * Side note: this still shows a system install dialog (we don't have
- * silent install — that's Shizuku territory in Week 4). The win is
+ * Side note: this still shows a system install dialog. The win is
  * pure serialization: you tap Install, the dialog completes, then
  * the NEXT dialog appears. No queue races.
  */

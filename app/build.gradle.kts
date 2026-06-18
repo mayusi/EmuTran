@@ -57,8 +57,8 @@ android {
         applicationId = "io.github.mayusi.emutran"
         minSdk = 29              // Android 10 — earliest still in active use on handhelds
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.3.3"
+        versionCode = 7
+        versionName = "0.3.4"
 
         ndk {
             // ARM64 only. Every supported handheld is aarch64.

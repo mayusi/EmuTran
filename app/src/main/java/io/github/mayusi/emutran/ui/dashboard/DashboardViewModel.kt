@@ -31,6 +31,7 @@ import io.github.mayusi.emutran.domain.drivers.DriverHintProvider
 import io.github.mayusi.emutran.domain.install.InstallerRouter
 import io.github.mayusi.emutran.domain.install.Uninstaller
 import io.github.mayusi.emutran.domain.scaffold.resolveTurnipDir
+import io.github.mayusi.emutran.ui.common.DOWNLOAD_EMIT_THROTTLE_MS
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -566,9 +567,36 @@ class DashboardViewModel @Inject constructor(
                     return@launch
                 }
 
+                // Source-rot self-healing: surface a subtle note when the primary
+                // (latest) release was unavailable and recovery used an older release.
+                // This is emitted early so it reaches the snackbar before the final
+                // "Installed" message (which replaces it if both arrive quickly).
+                if (resolved.recoveredVia != null) {
+                    _userMessage.emit(
+                        "Note: ${entry.name} resolved via an older release — latest was unavailable"
+                    )
+                }
+
+                // FIX 1 (SHA-256 sidecar): the dashboard install path passed no
+                // expectedSha256, so AvailableCard/EmuHelper installs were UNVERIFIED
+                // unlike the setup + update paths. Mirror ProgressViewModel:441-450 —
+                // when the source published a sidecar, fetch the hash now and treat a
+                // fetch failure as a HARD abort (never install without the integrity
+                // check). When no sidecar exists, proceed unverified.
+                val expectedSha256: String? = if (resolved.sha256Url != null) {
+                    val hash = router.fetchSha256Sidecar(resolved.sha256Url)
+                    if (hash == null) {
+                        _userMessage.emit("Install failed: integrity check failed")
+                        return@launch
+                    }
+                    hash
+                } else {
+                    null  // No sidecar published for this release; download proceeds unverified.
+                }
+
                 var file: File? = null
                 var downloadError: String? = null
-                downloader.download(resolved.apkUrl, resolved.filename).collect { p ->
+                downloader.download(resolved.apkUrl, resolved.filename, expectedSha256).collect { p ->
                     when (p) {
                         is ApkDownloader.Progress.Done -> file = p.file
                         is ApkDownloader.Progress.Failed -> downloadError = p.message
@@ -627,7 +655,5 @@ class DashboardViewModel @Inject constructor(
         private const val TAG = "DashboardViewModel"
         /** Debounce window for refresh() calls: 50ms. */
         private const val REFRESH_DEBOUNCE_MS = 50L
-        /** Minimum interval between Downloading state emissions: ~200ms. */
-        private const val DOWNLOAD_EMIT_THROTTLE_MS = 200L
     }
 }

@@ -39,7 +39,17 @@ class GiteaSource @Inject constructor(
             ?: return@withContext ResolveResult.Failed("Not a recognized Gitea URL: ${entry.sourceUrl}")
 
         val (host, ownerRepo) = parsed
-        val endpoint = "https://$host/api/v1/repos/$ownerRepo/releases/latest"
+
+        // FIX 9: /releases/latest excludes prereleases and only ever returns one
+        // release. If the entry wants prereleases or an older-release fallback, hit
+        // the broader /releases?limit=10 endpoint and pick the first match ourselves
+        // (mirrors GitHubReleasesSource). The Gitea API uses `limit`, not `per_page`.
+        val needsBroaderList = entry.includePrereleases || entry.fallbackToOlderReleases
+        val endpoint = if (needsBroaderList) {
+            "https://$host/api/v1/repos/$ownerRepo/releases?limit=10"
+        } else {
+            "https://$host/api/v1/repos/$ownerRepo/releases/latest"
+        }
 
         // Send If-None-Match if we've seen this endpoint before.
         val cached = cache.get(endpoint)
@@ -56,7 +66,7 @@ class GiteaSource @Inject constructor(
             client.newCall(request).execute().use { response ->
                 // 304 Not Modified → reuse cached body.
                 if (response.code == 304 && cached != null) {
-                    return@withContext parseAndPick(cached.body, entry, ownerRepo)
+                    return@withContext parseAndPick(cached.body, entry, ownerRepo, needsBroaderList)
                 }
                 if (!response.isSuccessful) {
                     return@withContext ResolveResult.Failed("Gitea ${response.code} on $ownerRepo")
@@ -69,7 +79,7 @@ class GiteaSource @Inject constructor(
                     cache.put(endpoint, HttpCache.Entry(etag, body, System.currentTimeMillis()))
                 }
 
-                parseAndPick(body, entry, ownerRepo)
+                parseAndPick(body, entry, ownerRepo, needsBroaderList)
             }
         } catch (t: Throwable) {
             ResolveResult.Failed(t.message ?: t.javaClass.simpleName)
@@ -81,32 +91,46 @@ class GiteaSource @Inject constructor(
         body: String,
         entry: AppEntry,
         ownerRepo: String,
+        broaderList: Boolean,
     ): ResolveResult {
-        val release = json.decodeFromString<GhRelease>(body)
-        val assetNames = release.assets.map { it.name }
-        val picked = ApkAssetFilter.pick(assetNames, entry)
-            ?: return ResolveResult.Failed("No matching asset for $ownerRepo")
-        val (pickedName, kind) = picked
-        // Use firstOrNull to avoid NoSuchElementException on a malformed response.
-        val asset = release.assets.firstOrNull { it.name == pickedName }
-            ?: return ResolveResult.Failed("Asset '$pickedName' not found in response for $ownerRepo")
+        // FIX 9: /releases returns a JSON array; /releases/latest returns one object.
+        val releases: List<GhRelease> = if (broaderList) {
+            json.decodeFromString(body)
+        } else {
+            listOf(json.decodeFromString<GhRelease>(body))
+        }
 
-        // SHA-256 sidecar: look for a sibling asset named "<apkName>.sha256".
-        val sidecarName = asset.name + ".sha256"
-        val sha256Url = release.assets
-            .firstOrNull { it.name.equals(sidecarName, ignoreCase = true) }
-            ?.browserDownloadUrl
+        // Walk releases newest-first; with fallbackToOlderReleases the first one
+        // that yields a matching asset wins (the broader list lets us fall back).
+        for (release in releases) {
+            // Skip prereleases unless the entry opted in.
+            if (!entry.includePrereleases && release.prerelease) continue
+            val assetNames = release.assets.map { it.name }
+            val picked = ApkAssetFilter.pick(assetNames, entry) ?: continue
+            val (pickedName, kind) = picked
+            // Use firstOrNull to avoid NoSuchElementException on a malformed response.
+            val asset = release.assets.firstOrNull { it.name == pickedName } ?: continue
 
-        // Sanitize remote asset name to guard against path traversal.
-        val safeFilename = ApkAssetFilter.sanitizeFilename(asset.name)
+            // SHA-256 sidecar: look for a sibling asset named "<apkName>.sha256".
+            val sidecarName = asset.name + ".sha256"
+            val sha256Url = release.assets
+                .firstOrNull { it.name.equals(sidecarName, ignoreCase = true) }
+                ?.browserDownloadUrl
 
-        return ResolveResult.Found(
-            apkUrl = asset.browserDownloadUrl,
-            filename = safeFilename,
-            version = release.tagName ?: release.name ?: "unknown",
-            sizeBytes = asset.size,
-            kind = kind,
-            sha256Url = sha256Url,
+            // Sanitize remote asset name to guard against path traversal.
+            val safeFilename = ApkAssetFilter.sanitizeFilename(asset.name)
+
+            return ResolveResult.Found(
+                apkUrl = asset.browserDownloadUrl,
+                filename = safeFilename,
+                version = release.tagName ?: release.name ?: "unknown",
+                sizeBytes = asset.size,
+                kind = kind,
+                sha256Url = sha256Url,
+            )
+        }
+        return ResolveResult.Failed(
+            "No matching asset across ${releases.size} release(s) for $ownerRepo"
         )
     }
 

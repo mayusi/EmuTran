@@ -1,7 +1,6 @@
 package io.github.mayusi.emutran.data.source
 
 import io.github.mayusi.emutran.data.manifest.AppEntry
-import io.github.mayusi.emutran.data.manifest.SourceKind
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -13,7 +12,8 @@ import javax.inject.Singleton
  * Picks the right [AppSource] for an [AppEntry] and calls into it.
  *
  * Everything outside `data/source/` talks to this. Adding a new source
- * type means writing one new implementation and adding it to the `when`.
+ * type means writing one new implementation and adding it to the `when` inside
+ * [ResilientResolver.dispatchToSource].
  *
  * FIX 1 (SHA-256 sidecar): This router also exposes [fetchSha256Sidecar],
  * which ProgressViewModel calls to resolve an expectedSha256 before handing
@@ -27,20 +27,24 @@ import javax.inject.Singleton
  *   - If [ResolveResult.Found.sha256Url] is null (HTML-scrape sources,
  *     releases without sidecars), verification is skipped. This is acceptable
  *     because those paths depend on transport hardening (FIX 3) instead.
+ *
+ * Source-rot self-healing: [resolve] now delegates to [ResilientResolver]
+ * which walks a fallback ladder (latest → older release) before returning
+ * [ResolveResult.Failed]. Every caller benefits transparently; when a fallback
+ * tier succeeded the returned [ResolveResult.Found.recoveredVia] is non-null
+ * so callers can surface a subtle note to the user.
  */
 @Singleton
 class AppSourceRouter @Inject constructor(
-    private val github: GitHubReleasesSource,
-    private val gitea: GiteaSource,
-    private val htmlScrape: HtmlScrapeSource,
+    private val resilient: ResilientResolver,
     private val client: OkHttpClient,
 ) {
-    suspend fun resolve(entry: AppEntry): ResolveResult = when (entry.source) {
-        SourceKind.GITHUB -> github.resolve(entry)
-        SourceKind.GITEA -> gitea.resolve(entry)
-        SourceKind.HTML_SCRAPE -> htmlScrape.resolve(entry)
-        SourceKind.UNKNOWN -> ResolveResult.Failed("Source not supported yet")
-    }
+    /**
+     * Resolve [entry] to a download URL, running the source-rot fallback
+     * ladder via [ResilientResolver] before returning failure. All SHA-256
+     * integrity contracts are preserved on every tier.
+     */
+    suspend fun resolve(entry: AppEntry): ResolveResult = resilient.resolve(entry)
 
     /**
      * FIX 1: Fetches the SHA-256 sidecar at [sha256Url] and returns the

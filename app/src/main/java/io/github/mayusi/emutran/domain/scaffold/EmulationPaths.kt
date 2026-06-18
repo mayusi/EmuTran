@@ -15,11 +15,6 @@ import java.io.File
  *
  * [resolveEmulationRoot] and [resolveTurnipDir] handle both cases so callers
  * don't have to repeat the check.
- *
- * Note: ProgressViewModel contains the same logic inline (see resolveTurnipDir
- * there). Both could be unified to call these helpers in a future cleanup,
- * but ProgressViewModel is intentionally left untouched here to avoid
- * colliding with parallel agent work.
  */
 
 /**

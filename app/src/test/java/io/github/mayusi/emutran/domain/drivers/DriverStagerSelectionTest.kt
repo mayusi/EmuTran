@@ -5,6 +5,7 @@ import io.github.mayusi.emutran.data.device.GpuFamily
 import io.github.mayusi.emutran.data.device.GpuInfo
 import io.github.mayusi.emutran.data.source.GhAsset
 import io.github.mayusi.emutran.data.source.GhRelease
+import io.github.mayusi.emutran.data.source.HttpCache
 import io.mockk.mockk
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
@@ -12,10 +13,11 @@ import org.junit.Test
 
 class DriverStagerSelectionTest {
 
-    // DriverStager now requires an injected OkHttpClient and Json. The selection
-    // tests are pure (no network, no JSON parsing), so a relaxed OkHttpClient
-    // mock and a default Json instance are sufficient.
-    private val stager = DriverStager(mockk<OkHttpClient>(relaxed = true), Json)
+    // DriverStager now requires an injected OkHttpClient, Json, and HttpCache.
+    // The selection tests are pure (no network, no JSON parsing, no cache use),
+    // so a relaxed OkHttpClient mock, a default Json instance, and a relaxed
+    // HttpCache mock are sufficient.
+    private val stager = DriverStager(mockk<OkHttpClient>(relaxed = true), Json, mockk<HttpCache>(relaxed = true))
 
     /** Releases modeled on the real K11MCH1/AdrenoToolsDrivers API,
      * newest-first. */

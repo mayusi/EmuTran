@@ -23,10 +23,12 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import io.github.mayusi.emutran.ui.about.AboutScreen
+import io.github.mayusi.emutran.ui.bios.BiosHelperScreen
 import io.github.mayusi.emutran.ui.common.DiscordPromptDialog
 import io.github.mayusi.emutran.ui.dashboard.DashboardScreen
 import io.github.mayusi.emutran.ui.health.HealthCheckScreen
 import io.github.mayusi.emutran.ui.deviceinfo.DeviceInfoScreen
+import io.github.mayusi.emutran.ui.romsort.RomSortScreen
 import io.github.mayusi.emutran.ui.done.DoneScreen
 import io.github.mayusi.emutran.ui.permissions.PermissionsScreen
 import io.github.mayusi.emutran.ui.pickapps.PickAppsScreen
@@ -67,6 +69,8 @@ object Routes {
     const val ABOUT = "about"
     const val HEALTH = "health"
     const val PROFILE = "profile"
+    const val BIOS = "bios"
+    const val ROM_SORT = "rom_sort"
 }
 
 // The top-level Scaffold intentionally ignores its content padding: each NavHost
@@ -210,6 +214,12 @@ fun EmuTranApp(
                         onProfile = {
                             navController.navigate(Routes.PROFILE)
                         },
+                        onBiosHelper = {
+                            navController.navigate(Routes.BIOS)
+                        },
+                        onSortRoms = {
+                            navController.navigate(Routes.ROM_SORT)
+                        },
                     )
                 }
                 composable(Routes.ABOUT) {
@@ -233,6 +243,12 @@ fun EmuTranApp(
                             }
                         },
                     )
+                }
+                composable(Routes.BIOS) {
+                    BiosHelperScreen(onBack = { navController.popBackStack() })
+                }
+                composable(Routes.ROM_SORT) {
+                    RomSortScreen(onBack = { navController.popBackStack() })
                 }
             }
         }

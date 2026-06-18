@@ -14,6 +14,7 @@ import androidx.core.content.ContextCompat
 import dagger.hilt.android.qualifiers.ApplicationContext
 import io.github.mayusi.emutran.MainActivity
 import io.github.mayusi.emutran.R
+import io.github.mayusi.emutran.ui.common.truncatedNames
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -156,17 +157,13 @@ class UpdateNotifier @Inject constructor(
      *   "Dolphin, PPSSPP, +3 more"       (many updates)
      *   "Dolphin, PPSSPP, RetroArch"     (few updates, all fit)
      *   "Dolphin"                         (single update)
+     *
+     * Delegates to the count-aware [truncatedNames] overload so the "+N more"
+     * truncation logic lives in one place; the "+N" remainder uses [count] (the
+     * true total) rather than the possibly-truncated sample size.
      */
-    private fun buildBodyText(count: Int, sampleNames: List<String>): String {
-        val maxShown = 3
-        return if (sampleNames.size <= maxShown) {
-            sampleNames.joinToString(", ")
-        } else {
-            val shown = sampleNames.take(maxShown).joinToString(", ")
-            val remaining = count - maxShown
-            "$shown, +$remaining more"
-        }
-    }
+    private fun buildBodyText(count: Int, sampleNames: List<String>): String =
+        truncatedNames(sampleNames, total = count, max = 3)
 
     companion object {
         /** Channel id for emulator-update notifications. */

@@ -215,6 +215,47 @@ class UpdateRepositoryComputeHasUpdateTest {
         assertThat(result).isFalse()
     }
 
+    @Test
+    fun `date tag with build suffix on available - indeterminate - no update`() {
+        // FIX #14: a date tag carrying a build suffix ("2024-12-01-build4") used
+        // to slip past the strict date regex, then SemVer-parse to 2024.12.1 and
+        // false-badge forever. The broadened heuristic now classifies it as a
+        // date → indeterminate → no badge.
+        val result = repo.computeHasUpdate(info(
+            installedVersionName = "2024.11.01",
+            availableVersion     = "2024-12-01-build4",
+        ))
+        assertThat(result).isFalse()
+    }
+
+    @Test
+    fun `date tag with build suffix on installed - indeterminate - no update`() {
+        val result = repo.computeHasUpdate(info(
+            installedVersionName = "2024-12-01-build4",
+            availableVersion     = "1.15.0",
+        ))
+        assertThat(result).isFalse()
+    }
+
+    @Test
+    fun `date tag with v prefix and suffix - indeterminate - no update`() {
+        val result = repo.computeHasUpdate(info(
+            installedVersionName = "2024.11.01",
+            availableVersion     = "v2025.01.15-nightly",
+        ))
+        assertThat(result).isFalse()
+    }
+
+    @Test
+    fun `year-month only date tag - indeterminate - no update`() {
+        // Two-part date (year + month, no day) is still a calendar tag.
+        val result = repo.computeHasUpdate(info(
+            installedVersionName = "2024-11",
+            availableVersion     = "2024-12",
+        ))
+        assertThat(result).isFalse()
+    }
+
     // ── Unparseable / unknown / hash → indeterminate → false ──────────────────
 
     @Test

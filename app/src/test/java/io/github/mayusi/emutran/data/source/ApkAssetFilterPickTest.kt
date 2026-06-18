@@ -328,6 +328,33 @@ class ApkAssetFilterPickTest {
     }
 
     @Test
+    fun `uncompilable regex pattern does not throw and leaves pool unchanged`() {
+        // FIX 11: An unbalanced character class "[" passes the length and
+        // nested-quantifier guards but throws inside Regex(). Previously the
+        // ConcurrentHashMap-backed cache rejected the null result with an NPE,
+        // surfacing as ResolveResult.Failed. The fix must compile to null
+        // gracefully (no throw) and leave the pool unfiltered.
+        val badPattern = "app[" // unterminated character class
+        val assets = listOf("app-arm64.apk")
+        val e = entry(apkFilterRegEx = badPattern, autoFilterByArch = false)
+        val result = pick(assets, e)
+        assertThat(result).isNotNull()
+        assertThat(result!!.first).isEqualTo("app-arm64.apk")
+    }
+
+    @Test
+    fun `uncompilable regex is consistent across repeated calls (negative cache)`() {
+        // FIX 11: the second call must hit the badPatterns negative cache and still
+        // return cleanly without throwing — i.e. the bad pattern is never stored in
+        // the value cache, and re-resolving the same entry stays stable.
+        val badPattern = "(unbalanced" // unterminated group
+        val assets = listOf("app-arm64.apk")
+        val e = entry(apkFilterRegEx = badPattern, autoFilterByArch = false)
+        assertThat(pick(assets, e)!!.first).isEqualTo("app-arm64.apk")
+        assertThat(pick(assets, e)!!.first).isEqualTo("app-arm64.apk")
+    }
+
+    @Test
     fun `valid regex at exactly MAX_PATTERN_LENGTH is accepted`() {
         // Pattern of 512 'a' chars is a valid simple literal — compileFilterRegex must accept it.
         // It won't match "app.apk", so filtered set is empty → pool kept unchanged.

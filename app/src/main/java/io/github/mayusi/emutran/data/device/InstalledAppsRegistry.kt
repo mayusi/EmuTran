@@ -40,9 +40,11 @@ import javax.inject.Singleton
  *    PickAppsViewModel.refreshInstalled) rely on the TTL-based cache, which
  *    is always warm by the time the user reaches those screens since
  *    ProgressViewModel called refresh() during setup.
- *  - [invalidate] clears the cache; call it after an install/uninstall
- *    event so the next snapshot() forces a re-query. DashboardViewModel
- *    and UpdateRepository should call this — see note in report.
+ *
+ * After a known install/uninstall event, call [refresh] (it re-queries
+ * PackageManager and re-warms the cache in one step) rather than waiting for
+ * the TTL to lapse — UpdateRepository.updateOne does this after a successful
+ * install.
  */
 @Singleton
 class InstalledAppsRegistry @Inject constructor(
@@ -91,16 +93,6 @@ class InstalledAppsRegistry @Inject constructor(
         val fresh = withContext(Dispatchers.IO) { queryPackageManager() }
         cachedSet = fresh
         cacheTimestampMs = System.currentTimeMillis()
-    }
-
-    /**
-     * Invalidate the cache so the next [snapshot] call forces a fresh
-     * PackageManager query. Call this after a known install or uninstall
-     * event completes (e.g., in DashboardViewModel after updateViaRepository
-     * finishes, or after uninstall is detected on ON_RESUME).
-     */
-    fun invalidate() {
-        cacheTimestampMs = 0L
     }
 
     /** Raw PackageManager query — always blocking, always off-cache. */

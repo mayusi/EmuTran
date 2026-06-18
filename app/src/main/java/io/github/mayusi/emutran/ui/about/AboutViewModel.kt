@@ -7,6 +7,7 @@ import io.github.mayusi.emutran.data.auth.GithubTokenStore
 import io.github.mayusi.emutran.data.update.SelfUpdateProgress
 import io.github.mayusi.emutran.data.update.SelfUpdateRepository
 import io.github.mayusi.emutran.data.update.SelfUpdateResult
+import io.github.mayusi.emutran.ui.common.DOWNLOAD_EMIT_THROTTLE_MS
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -206,10 +207,5 @@ class AboutViewModel @Inject constructor(
         data class NeedsInstallPermission(val apkUrl: String) : SelfUpdateUiState
         data object UpToDate    : SelfUpdateUiState
         data class Failed(val reason: String) : SelfUpdateUiState
-    }
-
-    companion object {
-        /** Minimum interval between Downloading state emissions: ~200ms. */
-        private const val DOWNLOAD_EMIT_THROTTLE_MS = 200L
     }
 }

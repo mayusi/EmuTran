@@ -8,6 +8,7 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.first
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -52,7 +53,7 @@ class HttpCache @Inject constructor(
      */
     suspend fun get(url: String, maxAgeMs: Long = DEFAULT_TTL_MS): Entry? {
         val candidate = memCache[url] ?: run {
-            val key = stringPreferencesKey(url)
+            val key = stringPreferencesKey(keyFor(url))
             val raw = context.httpCacheStore.data.first()[key] ?: return null
             val parsed = runCatching { json.decodeFromString<Entry>(raw) }.getOrNull()
                 ?: return null
@@ -67,14 +68,26 @@ class HttpCache @Inject constructor(
     /** Store [entry] for [url]. Overwrites any previous entry. */
     suspend fun put(url: String, entry: Entry) {
         memCache[url] = entry
-        val key = stringPreferencesKey(url)
+        val key = stringPreferencesKey(keyFor(url))
         context.httpCacheStore.edit { it[key] = json.encodeToString(Entry.serializer(), entry) }
     }
 
-    /** Wipe everything. Surfaced for a future "reset cache" debug action. */
-    suspend fun clear() {
-        memCache.clear()
-        context.httpCacheStore.edit { it.clear() }
+    /**
+     * FIX 4: Maps a raw [url] to a stable, fixed-length, prefs-safe DataStore key.
+     *
+     * Using the raw URL as the key risked corrupting the prefs file with long or
+     * XML-special characters. Instead we hash the URL with SHA-256 and take the
+     * first 32 hex chars (128 bits) — collision-safe for our scale and free of any
+     * special characters. Applied to BOTH [get] and [put] so reads and writes stay
+     * matched; the in-memory [memCache] still keys on the raw URL for the hot path.
+     *
+     * One-time effect: existing on-disk entries written under the old raw-URL keys
+     * become unreachable (a single cache miss → one re-fetch → re-cache under the
+     * new key). That is acceptable and self-healing.
+     */
+    private fun keyFor(url: String): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(url.toByteArray(Charsets.UTF_8))
+        return digest.take(16).joinToString("") { "%02x".format(it) }
     }
 
     companion object {

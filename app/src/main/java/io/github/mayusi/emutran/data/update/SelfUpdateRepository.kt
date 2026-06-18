@@ -145,7 +145,7 @@ class SelfUpdateRepository @Inject constructor(
      * sheet. The [ApkDownloader.Progress] events from the underlying download
      * are mapped to the matching [SelfUpdateProgress] variants.
      *
-     * == Install-permission gate (DEFECT 1) ==
+     * == Install-permission gate ==
      *
      * On Android 8+ the system installer silently no-ops if this app lacks the
      * per-app "Install unknown apps" grant. Before launching, we check
@@ -159,7 +159,7 @@ class SelfUpdateRepository @Inject constructor(
      * [ActivityNotFoundException] or [SecurityException] surfaces as
      * [SelfUpdateProgress.Failed] rather than crashing the flow.
      *
-     * == SHA-256 sidecar verification (DEFECT 2) ==
+     * == SHA-256 sidecar verification ==
      *
      * If [sha256Url] is non-null the sidecar is fetched first (with a few
      * retries — see [fetchSidecarHash]) and the hex hash is passed to the
@@ -182,7 +182,7 @@ class SelfUpdateRepository @Inject constructor(
         val filename = apkUrl.substringAfterLast('/').takeIf { it.isNotBlank() }
             ?: "emutran-update.apk"
 
-        // DEFECT 1 (install-permission gate): bail early — before downloading —
+        // Install-permission gate: bail early — before downloading —
         // if the OS won't let us install. Emitting a distinct state lets the UI
         // deep-link the user to the "Install unknown apps" settings page instead
         // of pulling the APK and then silently no-op'ing the installer.
@@ -201,9 +201,9 @@ class SelfUpdateRepository @Inject constructor(
         // targeted MITM that 404s the sidecar to bypass integrity checks. Only when
         // sha256Url is null (release publishes no sidecar) do we skip verification.
         //
-        // DEFECT 2 (resilient fetch): fetchSidecarHash now retries a few times with
-        // backoff, so a single transient non-2xx blip no longer aborts the whole
-        // update. Abort only happens after ALL retries genuinely fail.
+        // Resilient fetch: fetchSidecarHash retries a few times with backoff, so
+        // a single transient non-2xx blip no longer aborts the whole update.
+        // Abort only happens after ALL retries genuinely fail.
         val expectedSha256: String? = if (sha256Url != null) {
             val hash = fetchSidecarHash(sha256Url)
             if (hash == null) {
@@ -243,9 +243,9 @@ class SelfUpdateRepository @Inject constructor(
                     // Invalidate the 24h gate so the next launch-time check is fresh
                     // and won't re-offer a version the user is currently installing.
                     store.setSelfCheckEpoch(0L)
-                    // DEFECT 1: wrap the install hand-off so a missing installer
-                    // activity or a revoked permission surfaces as Failed instead
-                    // of crashing the collecting coroutine.
+                    // Wrap the install hand-off so a missing installer activity or
+                    // a revoked permission surfaces as Failed instead of crashing
+                    // the collecting coroutine.
                     try {
                         intentInstaller.install(progress.file)
                         emit(SelfUpdateProgress.Done)
@@ -329,10 +329,17 @@ class SelfUpdateRepository @Inject constructor(
     /**
      * Re-construct the last [SelfUpdateResult] from the HttpCache without
      * hitting the network. Called when the 24h gate is active.
+     *
+     * The cache read is bounded by [SELF_CHECK_INTERVAL_MS] (the same 24h gate)
+     * rather than an unbounded age: if the entry is older than that, the gate
+     * itself would have re-checked the network, so a stale hit here means we
+     * have no usable recent data. [HttpCache.get] returns null past that age,
+     * and we surface [SelfUpdateResult.Failed] so the caller treats it as "no
+     * cached data" instead of re-offering a months-old release as Available.
      */
     private suspend fun cachedSelfUpdateResult(): SelfUpdateResult {
-        val cached = httpCache.get(RELEASES_LATEST_URL, Long.MAX_VALUE) // any age is OK here
-            ?: return SelfUpdateResult.Failed("No cached release data")
+        val cached = httpCache.get(RELEASES_LATEST_URL, SELF_CHECK_INTERVAL_MS)
+            ?: return SelfUpdateResult.Failed("No recent cached release data")
         return parseRelease(cached.body)
     }
 
@@ -342,9 +349,9 @@ class SelfUpdateRepository @Inject constructor(
             val release = json.decodeFromString<GhRelease>(body)
             val tag = release.tagName ?: return SelfUpdateResult.Failed("Missing tag_name")
 
-            // FIX 3: Skip drafts and pre-releases — releases/latest usually
-            // excludes them, but this is cheap belt-and-suspenders that also
-            // documents intent for anyone reading this code.
+            // Skip drafts and pre-releases — releases/latest usually excludes
+            // them, but this is cheap belt-and-suspenders that also documents
+            // intent for anyone reading this code.
             if (release.draft || release.prerelease) return SelfUpdateResult.UpToDate
 
             val currentSemver = SemVer.parse(BuildConfig.VERSION_NAME)
@@ -360,7 +367,7 @@ class SelfUpdateRepository @Inject constructor(
                 .minByOrNull { if ("arm64" in it.name.lowercase()) 0 else 1 }
                 ?: return SelfUpdateResult.Failed("No APK asset in release $tag")
 
-            // FIX 2: Look for a SHA-256 sidecar asset named "<apkName>.sha256".
+            // Look for a SHA-256 sidecar asset named "<apkName>.sha256".
             // The release process publishes it alongside the APK (e.g.
             // "EmuTran-arm64-v0.3.0.apk.sha256"). We store the URL here and
             // fetch + parse the actual hash at download time in downloadAndInstall.
@@ -386,7 +393,7 @@ class SelfUpdateRepository @Inject constructor(
      * not duplicated). Returns the lowercase hash string, or null if the fetch
      * or parse definitively fails.
      *
-     * DEFECT 2 (resilient fetch): the GET is retried up to [SIDECAR_FETCH_ATTEMPTS]
+     * Resilient fetch: the GET is retried up to [SIDECAR_FETCH_ATTEMPTS]
      * times with a short exponential backoff before giving up. This distinguishes
      * a single transient blip (a non-2xx / IO error on one attempt, which a retry
      * recovers from) from a sidecar that is genuinely unreachable (every attempt
@@ -451,7 +458,7 @@ class SelfUpdateRepository @Inject constructor(
         const val SELF_CHECK_INTERVAL_MS: Long = 24 * 60 * 60 * 1_000L
 
         /**
-         * DEFECT 2: total attempts to fetch the SHA-256 sidecar before aborting.
+         * Total attempts to fetch the SHA-256 sidecar before aborting.
          * One initial try + 2 retries. A single transient blip recovers; a
          * genuinely-unreachable sidecar still aborts the update (MITM safety).
          */
@@ -470,7 +477,7 @@ class SelfUpdateRepository @Inject constructor(
  * Progress events for [SelfUpdateRepository.downloadAndInstall].
  *
  * Mirrors the relevant [ApkDownloader.Progress] variants ([Started], [Chunk],
- * [Done], [Failed]) but adds [NeedsInstallPermission] (DEFECT 1) so the UI can
+ * [Done], [Failed]) but adds [NeedsInstallPermission] so the UI can
  * distinguish "the OS won't let us install yet — send the user to settings" from
  * a generic failure. UI agents switch on this to drive the self-update sheet.
  */
@@ -486,7 +493,7 @@ sealed interface SelfUpdateProgress {
     data object Done : SelfUpdateProgress
 
     /**
-     * DEFECT 1: the app lacks the per-app "Install unknown apps" grant (Android 8+),
+     * The app lacks the per-app "Install unknown apps" grant (Android 8+),
      * so the installer would silently no-op. The UI should show a message and an
      * action that calls [SelfUpdateRepository.openInstallPermissionSettings], then
      * let the user retry once they've enabled it.

@@ -20,7 +20,6 @@ sealed interface ResolveResult {
         val filename: String,
         val version: String,
         val sizeBytes: Long? = null,
-        val sha256: String? = null,
         /**
          * What kind of file this is. Drives where the install loop
          * sends it — APKs go through PackageInstaller, ZIPs land in
@@ -38,12 +37,33 @@ sealed interface ResolveResult {
          * (integrity for them depends on the transport hardening in FIX 3).
          */
         val sha256Url: String? = null,
+        /**
+         * Source-rot self-healing: non-null when this result came from a fallback
+         * tier rather than the normal latest-release path. Callers (dashboard,
+         * progress screen) surface a subtle note so the user knows an older or
+         * alternate release was used. Null means the normal path succeeded — the
+         * common case — so no UI noise is emitted.
+         */
+        val recoveredVia: RecoveryTier? = null,
     ) : ResolveResult
 
     data class Failed(val reason: String) : ResolveResult
 
     /** This source can't handle the entry — caller should pick a different source. */
     data object Unsupported : ResolveResult
+}
+
+/**
+ * Which fallback tier produced a [ResolveResult.Found] when the primary
+ * (latest-release) path failed. Used by the UI to emit a subtle recovery note
+ * without treating the result as a failure.
+ *
+ * Only appears on [ResolveResult.Found.recoveredVia]; the primary path always
+ * leaves it null.
+ */
+enum class RecoveryTier {
+    /** Resolved via an older published release of the same source (per_page/limit list walk). */
+    OLDER_RELEASE,
 }
 
 /** What we got back from a source. */
